@@ -2,6 +2,9 @@
 ; after `cargo build --release`. Keep AppVersion equal to the version in Cargo.toml.
 
 #define AppVersion "0.1.0"
+#ifndef ExeDir
+#define ExeDir "..\target\release"
+#endif
 
 [Setup]
 ; Fixed AppId so each new version upgrades the old install in place.
@@ -26,7 +29,7 @@ CloseApplications=yes
 RestartApplications=no
 
 [Files]
-Source: "..\target\release\DiscordTrim.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#ExeDir}\DiscordTrim.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DiscordTrim"; Filename: "{app}\DiscordTrim.exe"
