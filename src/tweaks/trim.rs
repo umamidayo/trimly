@@ -45,8 +45,8 @@ pub const STEAM: Target = Target {
     exes: &["steam.exe", "steamwebhelper.exe"],
 };
 
-/// Discord trimmed on a timer while its windows are shown too. Off by default: a trim on
-/// visible Discord can cause a short pause when it pages memory back in.
+/// Discord trimmed on a timer while its windows are shown too, for Discord kept open on another
+/// monitor. A trim on visible Discord can cause a short pause when it pages memory back in.
 pub const DISCORD_ACTIVE: Target = Target {
     id: "discord_trim_active",
     name: "Trim Discord memory while visible",
@@ -102,7 +102,7 @@ impl Tweak for TrimIdle {
         self.target.name
     }
     fn default_enabled(&self) -> bool {
-        !self.active
+        true
     }
     fn enable(&mut self, cfg: &Config) -> Result<(), String> {
         self.load_timing(cfg);

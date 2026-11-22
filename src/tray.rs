@@ -12,6 +12,9 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// Posted by a second launch (e.g. the Start menu shortcut) to open Settings in this instance.
+pub const WM_OPEN_SETTINGS: u32 = WM_APP + 2;
+pub const TRAY_CLASS: &str = "DiscordTrimTray";
 const ID_TWEAK_BASE: usize = 1000;
 const ID_AUTOSTART: usize = 2003;
 const ID_OPEN_CONFIG: usize = 2004;
@@ -186,9 +189,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     match msg {
         WM_TRAY => {
             let ev = loword(lp as usize);
-            if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP || ev == WM_CONTEXTMENU {
+            if ev == WM_LBUTTONUP {
+                settings::open();
+            } else if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU {
                 show_menu(hwnd);
             }
+            0
+        }
+        WM_OPEN_SETTINGS => {
+            settings::open();
             0
         }
         WM_DESTROY => {
@@ -214,7 +223,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 pub fn run(app: App) {
     unsafe {
         let hinst = GetModuleHandleW(null());
-        let class = wide("DiscordTrimTray");
+        let class = wide(TRAY_CLASS);
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wnd_proc),

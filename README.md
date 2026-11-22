@@ -12,15 +12,27 @@ A tiny Windows tray app that lowers Discord's memory use while Discord is in the
 
 Both features poll every 2 seconds and stop as soon as you turn them off. Both are on by default. Toggle either one from the tray menu.
 
-**Trim Discord memory while visible (off by default).** Trims Discord every `active_trim_interval_secs` (default 300) even when its windows are shown, for when Discord is on another monitor. A trim on visible Discord can cause a short pause while it pages memory back in.
+**Trim Discord memory while visible (on by default).** Trims Discord every `active_trim_interval_secs` (default 300) even when its windows are shown, for when Discord is on another monitor. A trim on visible Discord can cause a short pause while it pages memory back in.
 
-**Settings window.** Tray menu > **Settings...** lists every feature with a checkbox and every timing as a number box, with Save and Close. It also shows measured results: Discord's RAM right now, the number of trims, and the total freed by trims. "Freed" is the working-set drop measured across each `EmptyWorkingSet` call.
+**Settings window.** Left-click the tray icon, or launch DiscordTrim again (for example from the Start menu), to open it. Right-click the tray icon for the menu. It shows measured results at the top: Discord's RAM right now, and the trims run and memory freed across all apps. "Freed" is the working-set drop measured around each `EmptyWorkingSet` call. Below that, every feature has a checkbox and every timing has a number box.
+
+**Updates.** On start, the app checks this repo's latest GitHub release. If it's newer, the Settings window shows **Install update vX**, which downloads and runs the installer. Nothing installs without that click.
+
+## Releasing a new version
+
+1. Bump the version in `Cargo.toml` and in `installer/DiscordTrim.iss`.
+2. Run `release.bat`. It builds `dist\DiscordTrim-Setup.exe` (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
+3. Publish a GitHub release tagged `vX.Y.Z` with `DiscordTrim-Setup.exe` attached.
 
 ## What it does not do
 
 - It doesn't cap Discord's heap or set memory limits. A limit can crash Discord, so none is applied.
 - It doesn't touch Discord's settings, files, or network traffic.
 - It doesn't change push-to-talk. PTT is handled by Discord's own global hook, which this app doesn't touch.
+
+## Install
+
+Download `DiscordTrim-Setup.exe` from the [latest release](https://github.com/umamidayo/discord-trim/releases/latest) and run it. It installs for your user only, with no administrator prompt. Windows SmartScreen may warn because the installer isn't code-signed.
 
 ## Build and run
 

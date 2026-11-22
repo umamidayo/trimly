@@ -7,7 +7,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_SET_QUOTA,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
@@ -80,6 +81,13 @@ pub fn any_window_shown(pids: &[u32]) -> bool {
 pub fn open(pid: u32) -> Option<HANDLE> {
     let rights = PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION;
     let h = unsafe { OpenProcess(rights, 0, pid) };
+    (!h.is_null()).then_some(h)
+}
+
+/// Opens a process just to read its memory use. Works on processes `open` can't touch,
+/// such as an elevated Discord main process, so the RAM total counts every process.
+pub fn open_query(pid: u32) -> Option<HANDLE> {
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     (!h.is_null()).then_some(h)
 }
 
