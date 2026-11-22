@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 /// GitHub repo holding the releases, as "owner/name".
-const REPO: &str = "umamidayo/discord-trim";
+const REPO: &str = "umamidayo/trimly";
 const NO_WINDOW: u32 = 0x0800_0000; // CREATE_NO_WINDOW: no console flash
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ pub fn check_in_background() {
 /// The newest release, if it is newer than this build and has an installer attached.
 fn check() -> Option<Update> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = curl(&["-sfL", "-H", "User-Agent: DiscordTrim", &url])?;
+    let body = curl(&["-sfL", "-H", "User-Agent: Trimly", &url])?;
     let release: Release = serde_json::from_slice(&body).ok()?;
     let version = release.tag_name.trim_start_matches('v').to_string();
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
@@ -57,7 +57,7 @@ fn check() -> Option<Update> {
 
 /// Saves the installer to the temp folder and returns its path.
 pub fn download(u: &Update) -> Option<PathBuf> {
-    let path = std::env::temp_dir().join(format!("DiscordTrim-Setup-{}.exe", u.version));
+    let path = std::env::temp_dir().join(format!("Trimly-Setup-{}.exe", u.version));
     curl(&["-sfL", "-o", path.to_str()?, &u.url])?;
     Some(path)
 }

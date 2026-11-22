@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
-const EXES: &[&str] = &["explorer.exe"];
 const POLL: Duration = Duration::from_secs(2);
 
 /// Settings shared with the polling thread, so changes apply without a restart.
@@ -100,12 +99,12 @@ fn run(stop: &AtomicBool, timing: &Timing) {
         if !is_idle {
             idle_trimmed.clear();
         }
-        for pid in procs::pids(EXES) {
+        for pid in procs::pids(trim::EXPLORER_EXES) {
             let timer_due = last_trim.get(&pid).map_or(true, |t| t.elapsed() >= interval);
             // `insert` returns true only the first time this pid is seen in the current idle stretch.
             let idle_due = is_idle && idle_trimmed.insert(pid);
             if idle_due || timer_due {
-                trim::trim(pid);
+                trim::trim(pid, "Windows Explorer");
                 last_trim.insert(pid, Instant::now());
             }
         }

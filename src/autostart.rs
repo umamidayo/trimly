@@ -6,7 +6,7 @@ use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Registry::*;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const VALUE: &str = "DiscordTrim";
+const VALUE: &str = "Trimly";
 
 fn open() -> Option<HKEY> {
     let mut key: HKEY = null_mut();
@@ -23,6 +23,18 @@ pub fn is_enabled() -> bool {
     let rc = unsafe { RegQueryValueExW(key, name.as_ptr(), null_mut(), null_mut(), null_mut(), null_mut()) };
     unsafe { RegCloseKey(key) };
     rc == ERROR_SUCCESS
+}
+
+/// Moves the pre-rename "DiscordTrim" startup entry to this app's name, keeping it on if it was.
+/// shortcut: only the dev machine had the old name; delete after the first public release.
+pub fn migrate_old_value() {
+    let Some(key) = open() else { return };
+    let old = wide("DiscordTrim");
+    let had_old = unsafe { RegDeleteValueW(key, old.as_ptr()) } == ERROR_SUCCESS;
+    unsafe { RegCloseKey(key) };
+    if had_old {
+        set(true);
+    }
 }
 
 pub fn set(enabled: bool) {

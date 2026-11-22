@@ -14,7 +14,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted by a second launch (e.g. the Start menu shortcut) to open Settings in this instance.
 pub const WM_OPEN_SETTINGS: u32 = WM_APP + 2;
-pub const TRAY_CLASS: &str = "DiscordTrimTray";
+pub const TRAY_CLASS: &str = "TrimlyTray";
 const ID_TWEAK_BASE: usize = 1000;
 const ID_AUTOSTART: usize = 2003;
 const ID_OPEN_CONFIG: usize = 2004;
@@ -57,7 +57,7 @@ thread_local! {
 
 pub fn error_box(text: &str) {
     let t = wide(text);
-    let c = wide("DiscordTrim");
+    let c = wide("Trimly");
     unsafe { MessageBoxW(null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONWARNING) };
 }
 
@@ -75,7 +75,7 @@ unsafe fn add_icon(hwnd: HWND) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = icon;
-    let tip = wide("DiscordTrim");
+    let tip = wide("Trimly");
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -249,11 +249,6 @@ pub fn run(app: App) {
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            // Lets Tab, Enter (Save) and Esc (Close) work inside the settings window.
-            let sh = settings::hwnd();
-            if !sh.is_null() && IsDialogMessageW(sh, &msg) != 0 {
-                continue;
-            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

@@ -1,4 +1,4 @@
-//! Settings stored as JSON in %APPDATA%\DiscordTrim\config.json.
+//! Settings stored as JSON in %APPDATA%\Trimly\config.json.
 //! Unknown or missing fields fall back to defaults, so old configs keep working.
 
 use serde::{Deserialize, Serialize};
@@ -48,9 +48,21 @@ mod tests {
     }
 }
 
+fn appdata() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("DiscordTrim")
+    appdata().join("Trimly")
+}
+
+/// The app was called DiscordTrim before 0.1.0 shipped; move its settings folder over once.
+/// shortcut: only the dev machine had the old name; delete after the first public release.
+pub fn migrate_old_dir() {
+    let (old, new) = (appdata().join("DiscordTrim"), dir());
+    if old.is_dir() && !new.exists() {
+        let _ = std::fs::rename(old, new);
+    }
 }
 
 fn path() -> PathBuf {

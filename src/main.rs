@@ -1,4 +1,4 @@
-//! DiscordTrim: a tiny tray app that keeps Discord's memory use down.
+//! Trimly: a tiny tray app that keeps Discord's (and other apps') memory use down.
 //! See README.md for how it works and how to add a feature.
 
 #![windows_subsystem = "windows"]
@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, FindWindowW, PostMessageW, ASFW_ANY};
 
 fn main() {
-    let name = util::wide("Local\\DiscordTrim.SingleInstance");
+    let name = util::wide("Local\\Trimly.SingleInstance");
     let replace = std::env::args().any(|a| a == "--replace");
     unsafe {
         let mutex = CreateMutexW(null(), 1, name.as_ptr());
@@ -40,6 +40,8 @@ fn main() {
             }
         }
 
+        config::migrate_old_dir();
+        autostart::migrate_old_value();
         let mut cfg = config::load();
         if !cfg.first_run_done {
             // Start with Windows by default; the tray menu can turn it off.

@@ -5,9 +5,9 @@
 use super::Tweak;
 use crate::config::Config;
 use crate::procs;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -16,25 +16,48 @@ use windows_sys::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemor
 pub static TRIMS: AtomicU64 = AtomicU64::new(0);
 /// Bytes that left the working set during trims (measured before and after each EmptyWorkingSet).
 pub static FREED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The same freed bytes, split by app name.
+pub static FREED_BY_APP: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 
-/// One app to trim: its tray label, config key and the exe names of all its processes.
+/// An app Trimly watches: its display name, every exe it runs as, and the features that trim it.
+pub struct Tracked {
+    pub name: &'static str,
+    pub exes: &'static [&'static str],
+    pub features: &'static [&'static str],
+}
+
+pub const DISCORD_EXES: &[&str] = &["discord.exe"];
+pub const EXPLORER_EXES: &[&str] = &["explorer.exe"];
+
+/// Every app shown in the Overview, in display order.
+pub const APPS: [Tracked; 4] = [
+    Tracked { name: "Discord", exes: DISCORD_EXES, features: &["discord_trim_idle", "discord_trim_active"] },
+    Tracked { name: "Steam", exes: &["steam.exe", "steamwebhelper.exe"], features: &["steam_trim_idle"] },
+    Tracked { name: "Windows Explorer", exes: EXPLORER_EXES, features: &["explorer_trim_idle"] },
+    Tracked { name: "CTF Loader", exes: &["ctfmon.exe"], features: &["ctf_trim_idle"] },
+];
+
+/// One trim feature: its config key, tray label, the app it belongs to and that app's exes.
 #[derive(Clone, Copy)]
 pub struct Target {
     pub id: &'static str,
     pub name: &'static str,
+    pub app: &'static str,
     pub exes: &'static [&'static str],
 }
 
 pub const DISCORD: Target = Target {
     id: "discord_trim_idle",
     name: "Trim Discord memory when hidden",
-    exes: &["discord.exe"],
+    app: "Discord",
+    exes: DISCORD_EXES,
 };
 
 /// CTF Loader (text services). It has no visible windows, so it is always idle.
 pub const CTF_LOADER: Target = Target {
     id: "ctf_trim_idle",
     name: "Trim CTF Loader memory when hidden",
+    app: "CTF Loader",
     exes: &["ctfmon.exe"],
 };
 
@@ -42,6 +65,7 @@ pub const CTF_LOADER: Target = Target {
 pub const STEAM: Target = Target {
     id: "steam_trim_idle",
     name: "Trim Steam memory when hidden",
+    app: "Steam",
     exes: &["steam.exe", "steamwebhelper.exe"],
 };
 
@@ -50,7 +74,8 @@ pub const STEAM: Target = Target {
 pub const DISCORD_ACTIVE: Target = Target {
     id: "discord_trim_active",
     name: "Trim Discord memory while visible",
-    exes: &["discord.exe"],
+    app: "Discord",
+    exes: DISCORD_EXES,
 };
 
 /// Timing settings shared with the polling thread, so changes apply without a restart.
@@ -107,8 +132,8 @@ impl Tweak for TrimIdle {
     fn enable(&mut self, cfg: &Config) -> Result<(), String> {
         self.load_timing(cfg);
         let stop = Arc::new(AtomicBool::new(false));
-        let (s, t, exes, active) = (stop.clone(), self.timing.clone(), self.target.exes, self.active);
-        self.thread = Some(thread::spawn(move || run(&s, &t, exes, active)));
+        let (s, t, target, active) = (stop.clone(), self.timing.clone(), self.target, self.active);
+        self.thread = Some(thread::spawn(move || run(&s, &t, target, active)));
         self.stop = Some(stop);
         Ok(())
     }
@@ -132,14 +157,14 @@ impl Tweak for TrimIdle {
 /// again every `interval_secs`, because memory climbs back after a trim. Any shown window
 /// resets the cycle.
 /// Active mode ignores window state and trims every `active_interval_secs`.
-fn run(stop: &AtomicBool, timing: &Timing, exes: &[&str], active: bool) {
+fn run(stop: &AtomicBool, timing: &Timing, target: Target, active: bool) {
     let mut idle_since: Option<Instant> = None;
     let mut last_trim: HashMap<u32, Instant> = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
-        let pids = procs::pids(exes);
+        let pids = procs::pids(target.exes);
         if active {
             let interval = Duration::from_secs(timing.active_interval_secs.load(Ordering::Relaxed));
-            trim_due(&pids, &mut last_trim, interval);
+            trim_due(&pids, &mut last_trim, interval, target.app);
         } else if procs::any_window_shown(&pids) {
             idle_since = None;
             last_trim.clear();
@@ -148,7 +173,7 @@ fn run(stop: &AtomicBool, timing: &Timing, exes: &[&str], active: bool) {
             let delay = Duration::from_secs(timing.delay_secs.load(Ordering::Relaxed));
             let interval = Duration::from_secs(timing.interval_secs.load(Ordering::Relaxed));
             if since.elapsed() >= delay {
-                trim_due(&pids, &mut last_trim, interval);
+                trim_due(&pids, &mut last_trim, interval, target.app);
             }
         }
         sleep_unless_stopped(stop, POLL);
@@ -156,11 +181,11 @@ fn run(stop: &AtomicBool, timing: &Timing, exes: &[&str], active: bool) {
 }
 
 /// Trims each pid whose last trim is at least `interval` old.
-fn trim_due(pids: &[u32], last_trim: &mut HashMap<u32, Instant>, interval: Duration) {
+fn trim_due(pids: &[u32], last_trim: &mut HashMap<u32, Instant>, interval: Duration, app: &'static str) {
     for &pid in pids {
         let due = last_trim.get(&pid).map_or(true, |t| t.elapsed() >= interval);
         if due {
-            trim(pid);
+            trim(pid, app);
             last_trim.insert(pid, Instant::now());
         }
     }
@@ -168,15 +193,39 @@ fn trim_due(pids: &[u32], last_trim: &mut HashMap<u32, Instant>, interval: Durat
 
 const POLL: Duration = Duration::from_secs(2);
 
-/// Trims one process and records how many bytes left its working set.
-pub fn trim(pid: u32) {
-    let Some(h) = procs::open(pid) else { return };
+/// Trims one process of `app`, records how many bytes left its working set, and returns that.
+pub fn trim(pid: u32, app: &'static str) -> u64 {
+    let Some(h) = procs::open(pid) else { return 0 };
     let before = working_set(h);
     unsafe { EmptyWorkingSet(h) };
     let after = working_set(h);
     procs::close(h);
+    let freed = before.saturating_sub(after);
     TRIMS.fetch_add(1, Ordering::Relaxed);
-    FREED_BYTES.fetch_add(before.saturating_sub(after), Ordering::Relaxed);
+    FREED_BYTES.fetch_add(freed, Ordering::Relaxed);
+    if let Ok(mut by_app) = FREED_BY_APP.lock() {
+        *by_app.entry(app).or_default() += freed;
+    }
+    freed
+}
+
+/// Trims every process of a tracked app right now ("Trim" in the Overview). Returns bytes freed.
+pub fn trim_app(app: &Tracked) -> u64 {
+    procs::pids(app.exes).into_iter().map(|pid| trim(pid, app.name)).sum()
+}
+
+/// Current RAM (working set) of a tracked app across its processes, or None when it isn't running.
+/// Uses query-only handles, so elevated processes count too.
+pub fn app_ram(app: &Tracked) -> Option<u64> {
+    let pids = procs::pids(app.exes);
+    if pids.is_empty() {
+        return None;
+    }
+    Some(pids.into_iter().filter_map(procs::open_query).map(|h| {
+        let bytes = working_set(h);
+        procs::close(h);
+        bytes
+    }).sum())
 }
 
 pub fn working_set(h: windows_sys::Win32::Foundation::HANDLE) -> u64 {

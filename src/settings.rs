@@ -1,119 +1,98 @@
-//! Settings window, opened from the tray. Shows measured results (Discord's RAM now, trims run,
-//! memory freed) and edits the feature switches and timings.
+//! Settings window: the page in `ui.html`, shown in a WebView2 inside a plain Win32 window.
+//! The page sends small JSON commands (toggle a feature, change a timing, trim now); Rust
+//! answers by pushing the full state to `dt.update(...)` every second and after each command.
+//! The webview exists only while the window is open, so it costs no memory in the background.
 
-use crate::{autostart, config::{self, Config}, procs, tray::{error_box, APP}, tweaks::trim, update, util::{loword, wide}};
-use std::cell::Cell;
+use crate::{autostart, config::{self, Config}, tray::{error_box, APP}, tweaks::trim, update, util::wide};
+use serde::Deserialize;
+use serde_json::json;
+use std::cell::{Cell, RefCell};
 use std::mem::{size_of, zeroed};
+use std::num::NonZeroIsize;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+};
+use windows_sys::Win32::UI::Controls::MARGINS;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED};
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use wry::raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle};
+use wry::{WebContext, WebView, WebViewBuilder};
 
-// Control ids. Ranges let WM_CTLCOLORSTATIC pick colors by role.
-const FEAT_BASE: i32 = 3000; // one checkbox per tweak, in registry order
-const AUTOSTART: i32 = 3100;
-const TIME_BASE: i32 = 3200; // one number box per entry in TIMINGS
-const STAT_VALUE: i32 = 3300; // 3 big numbers
-const STAT_CAPTION: i32 = 3310; // 3 captions under them
-const MUTED: i32 = 3400; // gray text: subtitle and "sec" suffixes
-const UPDATE_BTN: i32 = 3500;
+const HTML: &str = include_str!("ui.html");
+/// Posted after a command so the page gets fresh state outside the webview's callback.
+const WM_PUSH_STATE: u32 = WM_APP + 20;
 const TIMER_ID: usize = 1;
 const MB: f64 = 1024.0 * 1024.0;
+// Window client size in 96-DPI pixels.
+const WIDTH: i32 = 460;
+const HEIGHT: i32 = 790;
 
-/// True while the update installer is downloading, so the button can't start a second one.
+/// True while the update installer is downloading, so a second click can't start another.
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
-
-/// Labels of the number boxes, in the order `timing_mut` maps them to config fields.
-const TIMINGS: [&str; 5] = [
-    "Trim hidden apps after",
-    "Repeat hidden-app trim every",
-    "Repeat visible Discord trim every",
-    "Trim Explorer after no input for",
-    "Repeat Explorer trim every",
-];
-
-// Layout in 96-DPI pixels, scaled to the monitor at creation.
-const W: i32 = 480;
-const PAD: i32 = 20;
-const TILE_Y: i32 = 84;
-const TILE_H: i32 = 76;
-const TILE_GAP: i32 = 10;
-const TILE_W: i32 = (W - 2 * PAD - 2 * TILE_GAP) / 3;
-const FOOTER_H: i32 = 56;
-
-// Colors (COLORREF is 0x00BBGGRR).
-const fn rgb(r: u32, g: u32, b: u32) -> u32 {
-    r | (g << 8) | (b << 16)
-}
-const TEXT: u32 = rgb(28, 28, 28);
-const GRAY: u32 = rgb(100, 100, 100);
-const ACCENT: u32 = rgb(64, 78, 200);
-const PANEL: u32 = rgb(243, 243, 243);
-const WHITE: u32 = rgb(255, 255, 255);
-
-#[derive(Clone, Copy)]
-struct Fonts {
-    body: HFONT,
-    header: HFONT,
-    title: HFONT,
-    stat: HFONT,
-}
 
 thread_local! {
     static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
-    static FONTS: Cell<Option<Fonts>> = const { Cell::new(None) };
-    static PANEL_BRUSH: Cell<HBRUSH> = const { Cell::new(null_mut()) };
-    static FOOTER_Y: Cell<i32> = const { Cell::new(0) };
+    static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
+    static CLASS_READY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The open settings window, or null. The message loop uses it for Tab, Enter and Esc.
-pub fn hwnd() -> HWND {
-    WINDOW.get()
+/// Commands the page can send. Anything else is ignored.
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum Cmd {
+    Ready,
+    Feature { id: String, on: bool },
+    Autostart { on: bool },
+    Timing { index: usize, value: u64 },
+    TrimNow { app: Option<String> },
+    Update,
+    Close,
+    Minimize,
+    /// Mouse down on the page's title bar: hand the drag to Windows.
+    Drag,
 }
 
-fn timing_mut(cfg: &mut Config, i: usize) -> &mut u64 {
-    match i {
+/// Config fields behind the page's timing rows, by index.
+fn timing_mut(cfg: &mut Config, i: usize) -> Option<&mut u64> {
+    Some(match i {
         0 => &mut cfg.trim_delay_secs,
         1 => &mut cfg.trim_interval_secs,
         2 => &mut cfg.active_trim_interval_secs,
         3 => &mut cfg.explorer_idle_secs,
-        _ => &mut cfg.explorer_interval_secs,
+        4 => &mut cfg.explorer_interval_secs,
+        _ => return None,
+    })
+}
+
+/// Lets wry attach the webview to our Win32 window.
+struct Host(HWND);
+
+impl HasWindowHandle for Host {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let hwnd = NonZeroIsize::new(self.0 as isize).ok_or(HandleError::Unavailable)?;
+        // Safe: the window outlives the borrow; it is destroyed only after the webview is dropped.
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(Win32WindowHandle::new(hwnd))) })
     }
 }
 
-/// Scales a size designed at 96 DPI to the monitor the window is on.
-unsafe fn scale(hwnd: HWND, px: i32) -> i32 {
-    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-    px * dpi / 96
-}
-
-/// Windows' own UI font (Segoe UI) at this DPI, plus bigger and bolder variants of it.
-unsafe fn make_fonts(dpi: u32) -> Fonts {
-    let mut ncm: NONCLIENTMETRICSW = zeroed();
-    ncm.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &mut ncm as *mut _ as _, 0, dpi);
-    let mut base = ncm.lfMessageFont;
-    if base.lfHeight == 0 {
-        // Fallback if the query failed: Segoe UI 9pt.
-        base.lfHeight = -(12 * dpi as i32 / 96);
-        let face = wide("Segoe UI");
-        base.lfFaceName[..face.len()].copy_from_slice(&face);
-    }
-    base.lfQuality = CLEARTYPE_QUALITY as u8;
-    // The message font is 9pt; `pt` scales from it.
-    let make = |pt: i32, weight: i32| {
-        let mut lf = base;
-        lf.lfHeight = base.lfHeight * pt / 9;
-        lf.lfWeight = weight;
-        CreateFontIndirectW(&lf)
+/// True when Windows is set to dark mode for apps.
+fn system_dark() -> bool {
+    let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let name = wide("AppsUseLightTheme");
+    let (mut v, mut size) = (1u32, 4u32);
+    let rc = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, null_mut(),
+            &mut v as *mut u32 as _, &mut size)
     };
-    Fonts { body: make(9, 400), header: make(11, 600), title: make(16, 600), stat: make(18, 600) }
+    rc == ERROR_SUCCESS && v == 0
 }
 
 pub fn open() {
@@ -124,285 +103,247 @@ pub fn open() {
             SetForegroundWindow(existing);
             return;
         }
+        let dark = system_dark();
+        // Matches the page background so there is no white flash before it loads.
+        let bg: (u8, u8, u8) = if dark { (14, 15, 19) } else { (243, 244, 248) };
         let hinst = GetModuleHandleW(null());
-        let class = wide("DiscordTrimSettings");
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: hinst,
-            lpszClassName: class.as_ptr(),
-            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hIcon: LoadIconW(hinst, 1 as _),
-            ..zeroed()
-        };
-        RegisterClassExW(&wc); // a second call just fails harmlessly
-        let title = wide("DiscordTrim");
+        let class = wide("TrimlySettings");
+        if !CLASS_READY.get() {
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(wnd_proc),
+                hInstance: hinst,
+                lpszClassName: class.as_ptr(),
+                hbrBackground: CreateSolidBrush(bg.0 as u32 | (bg.1 as u32) << 8 | (bg.2 as u32) << 16),
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                hIcon: LoadIconW(hinst, 1 as _),
+                ..zeroed()
+            };
+            CLASS_READY.set(RegisterClassExW(&wc) != 0);
+        }
+        let title = wide("Trimly");
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT,
             0, 0, null_mut(), null_mut(), hinst, null());
+        if hwnd.is_null() {
+            return;
+        }
         WINDOW.set(hwnd);
-        let fonts = make_fonts(GetDpiForWindow(hwnd).max(96));
-        FONTS.set(Some(fonts));
-        PANEL_BRUSH.set(CreateSolidBrush(PANEL));
-
-        // Header.
-        ctl(hwnd, "STATIC", "DiscordTrim", 0, PAD, 16, W - 2 * PAD, 32, 0, fonts.title);
-        ctl(hwnd, "STATIC", &format!("Keeps Discord's memory down in the background.   v{}", env!("CARGO_PKG_VERSION")),
-            0, PAD, 50, W - 2 * PAD, 20, MUTED, fonts.body);
-
-        // Results: three tiles with a big number and a caption.
-        let captions = ["Discord RAM now", "Trims (all apps)", "Freed (all apps)"];
-        for (i, caption) in captions.iter().enumerate() {
-            let x = PAD + i as i32 * (TILE_W + TILE_GAP) + 14;
-            ctl(hwnd, "STATIC", "", 0, x, TILE_Y + 10, TILE_W - 28, 34, STAT_VALUE + i as i32, fonts.stat);
-            ctl(hwnd, "STATIC", caption, 0, x, TILE_Y + 46, TILE_W - 28, 20, STAT_CAPTION + i as i32, fonts.body);
+        if dark {
+            let on: i32 = 1;
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &on as *const i32 as _, 4);
         }
-        refresh_stats(hwnd);
+        // The page draws its own title bar. WM_NCCALCSIZE removes the system one; a 1 px frame
+        // extension keeps the DWM drop shadow. Rounded corners apply on Windows 11 only.
+        let margins = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 };
+        DwmExtendFrameIntoClientArea(hwnd, &margins);
+        let round: i32 = 2; // DWMWCP_ROUND
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, &round as *const i32 as _, 4);
+        place(hwnd);
 
-        // Features: the same list as the tray menu, showing what runs right now.
-        let mut y = TILE_Y + TILE_H + 22;
-        ctl(hwnd, "STATIC", "Features", 0, PAD, y, W - 2 * PAD, 24, 0, fonts.header);
-        y += 30;
-        let features: Vec<(&str, bool)> = APP.with(|a| {
-            a.borrow().as_ref().map_or(Vec::new(), |app| app.tweaks.iter().map(|t| (t.name(), t.is_enabled())).collect())
-        });
-        let check = BS_AUTOCHECKBOX as u32 | WS_TABSTOP;
-        for (i, (name, on)) in features.iter().enumerate() {
-            ctl(hwnd, "BUTTON", name, check, PAD, y, W - 2 * PAD, 22, FEAT_BASE + i as i32, fonts.body);
-            CheckDlgButton(hwnd, FEAT_BASE + i as i32, if *on { BST_CHECKED } else { BST_UNCHECKED });
-            y += 26;
+        let mut ctx = WebContext::new(Some(config::dir().join("WebView2")));
+        let built = WebViewBuilder::new_with_web_context(&mut ctx)
+            .with_html(HTML)
+            .with_background_color((bg.0, bg.1, bg.2, 255))
+            .with_devtools(cfg!(debug_assertions))
+            .with_ipc_handler(|req| on_command(req.body()))
+            .build(&Host(hwnd));
+        match built {
+            Ok(webview) => WEBVIEW.with(|w| *w.borrow_mut() = Some(webview)),
+            Err(e) => {
+                DestroyWindow(hwnd);
+                error_box(&format!(
+                    "The settings window needs the Microsoft Edge WebView2 Runtime.\n\
+                     Get it from https://developer.microsoft.com/microsoft-edge/webview2/\n\n({e})"
+                ));
+                return;
+            }
         }
-        ctl(hwnd, "BUTTON", "Start with Windows", check, PAD, y, W - 2 * PAD, 22, AUTOSTART, fonts.body);
-        CheckDlgButton(hwnd, AUTOSTART, if autostart::is_enabled() { BST_CHECKED } else { BST_UNCHECKED });
-        y += 40;
-
-        // Timing: label, number box, "sec".
-        ctl(hwnd, "STATIC", "Timing", 0, PAD, y, W - 2 * PAD, 24, 0, fonts.header);
-        y += 32;
-        let mut cfg = APP.with(|a| a.borrow().as_ref().map(|app| app.cfg.clone())).unwrap_or_default();
-        let edit_x = W - PAD - 40 - 80;
-        for (i, label) in TIMINGS.iter().enumerate() {
-            let value = *timing_mut(&mut cfg, i);
-            ctl(hwnd, "STATIC", label, 0, PAD, y + 3, edit_x - PAD - 10, 20, 0, fonts.body);
-            ctlx(hwnd, WS_EX_CLIENTEDGE, "EDIT", &value.to_string(), WS_TABSTOP | ES_NUMBER as u32 | ES_RIGHT as u32 | ES_AUTOHSCROLL as u32,
-                edit_x, y, 80, 24, TIME_BASE + i as i32, fonts.body);
-            ctl(hwnd, "STATIC", "sec", 0, edit_x + 88, y + 3, 32, 20, MUTED, fonts.body);
-            y += 32;
-        }
-        y += 12;
-
-        // Footer bar: update on the left, Save and Close on the right.
-        FOOTER_Y.set(y);
-        let by = y + (FOOTER_H - 30) / 2;
-        let btn = BS_PUSHBUTTON as u32 | WS_TABSTOP;
-        // refresh_update_button hides this until the startup check finds a newer release.
-        ctl(hwnd, "BUTTON", "", btn, PAD, by, 170, 30, UPDATE_BTN, fonts.body);
-        ctl(hwnd, "BUTTON", "Save", BS_DEFPUSHBUTTON as u32 | WS_TABSTOP, W - PAD - 88 - 8 - 88, by, 88, 30, IDOK, fonts.body);
-        ctl(hwnd, "BUTTON", "Close", btn, W - PAD - 88, by, 88, 30, IDCANCEL, fonts.body);
-        refresh_update_button(hwnd);
-
-        // Size the window to fit, centered on the screen it opened on.
-        let mut rc = RECT { left: 0, top: 0, right: scale(hwnd, W), bottom: scale(hwnd, y + FOOTER_H) };
-        AdjustWindowRectEx(&mut rc, style, 0, 0);
-        let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
-        let mut mi: MONITORINFO = zeroed();
-        mi.cbSize = size_of::<MONITORINFO>() as u32;
-        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
-        let work = mi.rcWork;
-        let (x, y) = (work.left + (work.right - work.left - ww) / 2, work.top + (work.bottom - work.top - wh) / 2);
-        SetWindowPos(hwnd, null_mut(), x, y, ww, wh, SWP_NOZORDER);
-
-        SetTimer(hwnd, TIMER_ID, 2000, None);
+        SetTimer(hwnd, TIMER_ID, 1000, None);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
 }
 
-unsafe fn ctl(parent: HWND, class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32, font: HFONT) {
-    ctlx(parent, 0, class, text, style, x, y, w, h, id, font);
+/// Sizes the window for its monitor's DPI and centers it in the work area. The window has no
+/// system frame, so its size is the page size. SWP_FRAMECHANGED applies the WM_NCCALCSIZE change.
+unsafe fn place(hwnd: HWND) {
+    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
+    let work = mi.rcWork;
+    let (w, h) = (WIDTH * dpi / 96, (HEIGHT * dpi / 96).min(work.bottom - work.top));
+    let (x, y) = (work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2);
+    SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
 }
 
-/// Creates one child control. Position and size are in 96-DPI pixels.
-unsafe fn ctlx(parent: HWND, ex: u32, class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32, font: HFONT) {
-    let (c, t) = (wide(class), wide(text));
-    let child = CreateWindowExW(ex, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style,
-        scale(parent, x), scale(parent, y), scale(parent, w), scale(parent, h),
-        parent, id as usize as HMENU, GetModuleHandleW(null()), null());
-    SendMessageW(child, WM_SETFONT, font as usize, 1);
-}
-
-/// Measured results: Discord's RAM right now, trims run, and memory the trims freed.
-fn stats() -> [String; 3] {
-    let now: u64 = procs::pids(trim::DISCORD.exes)
-        .into_iter()
-        .filter_map(procs::open_query)
-        .map(|h| {
-            let bytes = trim::working_set(h);
-            procs::close(h);
-            bytes
-        })
-        .sum();
-    let freed = trim::FREED_BYTES.load(Ordering::Relaxed) as f64 / MB;
-    [
-        if now == 0 { "Not running".to_string() } else { format!("{:.0} MB", now as f64 / MB) },
-        trim::TRIMS.load(Ordering::Relaxed).to_string(),
-        if freed >= 1024.0 { format!("{:.2} GB", freed / 1024.0) } else { format!("{freed:.0} MB") },
-    ]
-}
-
-unsafe fn refresh_stats(hwnd: HWND) {
-    for (i, s) in stats().iter().enumerate() {
-        SetWindowTextW(GetDlgItem(hwnd, STAT_VALUE + i as i32), wide(s).as_ptr());
-    }
-}
-
-unsafe fn edit_text(h: HWND) -> String {
-    let mut buf = [0u16; 16];
-    let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
-    String::from_utf16_lossy(&buf[..n as usize])
-}
-
-/// Validates the number boxes, then applies everything to the running app. False on bad input.
-unsafe fn save(hwnd: HWND) -> bool {
-    let mut vals = [0u64; 5];
-    for (i, label) in TIMINGS.iter().enumerate() {
-        let edit = GetDlgItem(hwnd, TIME_BASE + i as i32);
-        match edit_text(edit).trim().parse::<u64>() {
-            Ok(v) if (1..=86_400).contains(&v) => vals[i] = v,
-            _ => {
-                error_box(&format!("\"{label}\" needs a whole number of seconds from 1 to 86400."));
-                SetFocus(edit);
-                return false;
+/// Runs a script in the page, if it is open and not busy in another call.
+fn eval(js: &str) {
+    WEBVIEW.with(|w| {
+        if let Ok(w) = w.try_borrow() {
+            if let Some(webview) = w.as_ref() {
+                let _ = webview.evaluate_script(js);
             }
         }
-    }
-    let autostart_on = IsDlgButtonChecked(hwnd, AUTOSTART) == BST_CHECKED;
-    let count = APP.with(|a| a.borrow().as_ref().map_or(0, |app| app.tweaks.len()));
-    let checks: Vec<bool> = (0..count).map(|i| IsDlgButtonChecked(hwnd, FEAT_BASE + i as i32) == BST_CHECKED).collect();
+    });
+}
 
+/// Everything the page shows, as JSON.
+fn state_json() -> String {
+    let (features, timings) = APP.with(|a| {
+        let a = a.try_borrow().ok()?;
+        let app = a.as_ref()?;
+        let features: Vec<_> = app.tweaks.iter()
+            .map(|t| json!({ "id": t.id(), "name": t.name(), "on": t.is_enabled() }))
+            .collect();
+        let mut cfg = app.cfg.clone();
+        let timings: Vec<u64> = (0..5).filter_map(|i| timing_mut(&mut cfg, i).map(|v| *v)).collect();
+        Some((features, timings))
+    }).unwrap_or_default();
+    let freed_by_app = trim::FREED_BY_APP.lock().map(|m| m.clone()).unwrap_or_default();
+    let feature_on = |id: &str| features.iter().any(|f| f["id"] == id && f["on"] == true);
+    let apps: Vec<_> = trim::APPS.iter().map(|app| {
+        let ram = trim::app_ram(app);
+        json!({
+            "name": app.name,
+            "running": ram.is_some(),
+            "ramMb": ram.unwrap_or(0) as f64 / MB,
+            "auto": app.features.iter().any(|id| feature_on(id)),
+            "freedMb": freed_by_app.get(app.name).copied().unwrap_or(0) as f64 / MB,
+        })
+    }).collect();
+    let update = update::AVAILABLE.lock().ok().and_then(|g| g.as_ref().map(|u| u.version.clone()));
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "apps": apps,
+        "trims": trim::TRIMS.load(Ordering::Relaxed),
+        "freedMb": trim::FREED_BYTES.load(Ordering::Relaxed) as f64 / MB,
+        "features": features,
+        "autostart": autostart::is_enabled(),
+        "timings": timings,
+        "update": update,
+        "downloading": DOWNLOADING.load(Ordering::Relaxed),
+        "active": unsafe { GetForegroundWindow() } == WINDOW.get(),
+    })
+    .to_string()
+}
+
+fn push_state() {
+    eval(&format!("window.dt && dt.update({})", state_json()));
+}
+
+/// Applies a change to the running app and saves it. Skipped if the app is busy (it never
+/// is for long; the next state push shows the real value either way).
+fn with_app(f: impl FnOnce(&mut crate::tray::App) -> bool) {
     APP.with(|a| {
-        if let Some(app) = a.borrow_mut().as_mut() {
-            for (i, v) in vals.iter().enumerate() {
-                *timing_mut(&mut app.cfg, i) = *v;
-            }
-            for (i, on) in checks.iter().enumerate() {
-                let id = app.tweaks[i].id().to_string();
-                app.cfg.tweaks.insert(id, *on);
-            }
+        let Ok(mut a) = a.try_borrow_mut() else { return };
+        let Some(app) = a.as_mut() else { return };
+        if f(app) {
             config::save(&app.cfg);
             app.sync();
         }
     });
-    autostart::set(autostart_on);
-    true
 }
 
-/// Shows "Install update vX" once a newer release was found at startup; hidden otherwise.
-unsafe fn refresh_update_button(hwnd: HWND) {
-    let version = update::AVAILABLE.lock().ok().and_then(|g| g.as_ref().map(|u| u.version.clone()));
-    let btn = GetDlgItem(hwnd, UPDATE_BTN);
-    let (text, enabled) = match version {
-        _ if DOWNLOADING.load(Ordering::Relaxed) => ("Downloading update...".to_string(), false),
-        Some(v) => (format!("Install update v{v}"), true),
-        None => {
-            ShowWindow(btn, SW_HIDE);
+/// Handles one message from the page. The page is ours, but input is still checked here.
+fn on_command(body: &str) {
+    let Ok(cmd) = serde_json::from_str::<Cmd>(body) else { return };
+    match cmd {
+        Cmd::Ready => {}
+        Cmd::Feature { id, on } => with_app(|app| {
+            let known = app.tweaks.iter().any(|t| t.id() == id);
+            if known {
+                app.cfg.tweaks.insert(id, on);
+            }
+            known
+        }),
+        Cmd::Autostart { on } => autostart::set(on),
+        Cmd::Timing { index, value } => with_app(|app| {
+            let Some(slot) = timing_mut(&mut app.cfg, index) else { return false };
+            *slot = value.clamp(1, 86_400);
+            true
+        }),
+        Cmd::TrimNow { app } => {
+            // A named app trims just that app; no name trims every tracked app.
+            let picked: Vec<_> = trim::APPS.iter().filter(|a| app.as_deref().map_or(true, |n| n == a.name)).collect();
+            if picked.is_empty() {
+                return;
+            }
+            let freed: u64 = picked.iter().map(|a| trim::trim_app(a)).sum();
+            let label = serde_json::to_string(&app).unwrap_or_else(|_| "null".into());
+            eval(&format!("window.dt && dt.trimmed({}, {label})", freed as f64 / MB));
+        }
+        Cmd::Update => start_update(),
+        Cmd::Close => {
+            unsafe { PostMessageW(WINDOW.get(), WM_CLOSE, 0, 0) };
             return;
         }
-    };
-    SetWindowTextW(btn, wide(&text).as_ptr());
-    EnableWindow(btn, enabled as i32);
-    ShowWindow(btn, SW_SHOW);
+        Cmd::Minimize => {
+            unsafe { PostMessageW(WINDOW.get(), WM_SYSCOMMAND, SC_MINIMIZE as usize, 0) };
+            return;
+        }
+        Cmd::Drag => {
+            unsafe {
+                let mut pt: POINT = zeroed();
+                GetCursorPos(&mut pt);
+                ReleaseCapture();
+                let at = ((pt.y as u16 as u32) << 16 | pt.x as u16 as u32) as LPARAM;
+                PostMessageW(WINDOW.get(), WM_NCLBUTTONDOWN, HTCAPTION as usize, at);
+            }
+            return;
+        }
+    }
+    unsafe { PostMessageW(WINDOW.get(), WM_PUSH_STATE, 0, 0) };
 }
 
 /// Downloads the newest installer on a worker thread, then runs it. The installer closes the
-/// running app itself (Inno Setup's CloseApplications), so this window doesn't exit anything.
-unsafe fn start_update(hwnd: HWND) {
+/// running app itself (Inno Setup's CloseApplications).
+fn start_update() {
     let Some(u) = update::AVAILABLE.lock().ok().and_then(|g| g.clone()) else { return };
-    DOWNLOADING.store(true, Ordering::Relaxed);
-    refresh_update_button(hwnd);
+    if DOWNLOADING.swap(true, Ordering::Relaxed) {
+        return;
+    }
     std::thread::spawn(move || {
         match update::download(&u) {
-            Some(path) => {
+            Some(path) => unsafe {
                 let file = wide(&path.display().to_string());
                 let open = wide("open");
                 ShellExecuteW(null_mut(), open.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL);
                 if let Ok(mut slot) = update::AVAILABLE.lock() {
                     *slot = None;
                 }
-            }
+            },
             None => error_box("Could not download the update. Check your internet connection, then try again."),
         }
         DOWNLOADING.store(false, Ordering::Relaxed);
     });
 }
 
-/// Paints the gray result tiles and footer bar; the white background comes from the window class.
-unsafe fn paint(hwnd: HWND) {
-    let mut ps: PAINTSTRUCT = zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let brush = PANEL_BRUSH.get();
-    for i in 0..3 {
-        let x = PAD + i * (TILE_W + TILE_GAP);
-        let r = RECT { left: scale(hwnd, x), top: scale(hwnd, TILE_Y), right: scale(hwnd, x + TILE_W), bottom: scale(hwnd, TILE_Y + TILE_H) };
-        FillRect(hdc, &r, brush);
-    }
-    let mut client: RECT = zeroed();
-    GetClientRect(hwnd, &mut client);
-    client.top = scale(hwnd, FOOTER_Y.get());
-    FillRect(hdc, &client, brush);
-    EndPaint(hwnd, &ps);
-}
-
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_COMMAND => {
-            match loword(wp) as i32 {
-                IDOK => {
-                    if save(hwnd) {
-                        DestroyWindow(hwnd);
-                    }
-                }
-                IDCANCEL => {
-                    DestroyWindow(hwnd);
-                }
-                UPDATE_BTN => start_update(hwnd),
-                _ => {}
-            }
+        WM_TIMER | WM_PUSH_STATE => {
+            push_state();
             0
         }
-        // Text color and background per control role; checkboxes come through here too.
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let hdc = wp as HDC;
-            let id = GetDlgCtrlID(lp as HWND);
-            let on_panel = (STAT_VALUE..STAT_CAPTION + 3).contains(&id) || id == UPDATE_BTN || id == IDOK || id == IDCANCEL;
-            let color = match id {
-                STAT_VALUE..=3302 => ACCENT,
-                STAT_CAPTION..=3312 | MUTED => GRAY,
-                _ => TEXT,
-            };
-            SetTextColor(hdc, color);
-            SetBkColor(hdc, if on_panel { PANEL } else { WHITE });
-            (if on_panel { PANEL_BRUSH.get() } else { GetSysColorBrush(COLOR_WINDOW) }) as LRESULT
+        // No system title bar or frame: the whole window is client area.
+        WM_NCCALCSIZE if wp != 0 => 0,
+        // Focus changed: refresh so the title bar dims or brightens right away.
+        WM_ACTIVATE => {
+            PostMessageW(hwnd, WM_PUSH_STATE, 0, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
-        WM_PAINT => {
-            paint(hwnd);
-            0
-        }
-        WM_TIMER => {
-            refresh_stats(hwnd);
-            refresh_update_button(hwnd);
+        // Moved to a monitor with a different scale: take the size Windows suggests.
+        WM_DPICHANGED => {
+            let r = &*(lp as *const RECT);
+            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             0
         }
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_ID);
+            // Dropping the webview shuts down its browser processes.
+            WEBVIEW.with(|w| w.borrow_mut().take());
             WINDOW.set(null_mut());
-            if let Some(f) = FONTS.take() {
-                for font in [f.body, f.header, f.title, f.stat] {
-                    DeleteObject(font as HGDIOBJ);
-                }
-            }
-            DeleteObject(PANEL_BRUSH.replace(null_mut()) as HGDIOBJ);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
