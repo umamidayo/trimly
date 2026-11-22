@@ -248,7 +248,7 @@ fn state_json() -> String {
         })
     }).collect();
     json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": update::current_version(),
         "now": engine::now(),
         "active": unsafe { GetForegroundWindow() } == hwnd,
         "maximized": unsafe { IsZoomed(hwnd) } != 0,
@@ -313,6 +313,13 @@ fn install_root(path: &Path) -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(|v| lower(Path::new(&v)));
     if env("SystemRoot").is_some_and(|w| path.starts_with(w)) {
         return None;
+    }
+    // Games in a Steam library (...\steamapps\common\<game>\...) are their own programs, even
+    // though the library sits inside Steam's folder: group them by their game folder.
+    let parts: Vec<_> = path.components().collect();
+    if let Some(i) = parts.iter().position(|c| c.as_os_str() == "steamapps") {
+        let end = (i + 3).min(parts.len() - 1);
+        return Some(parts[..end].iter().collect());
     }
     let local = env("LOCALAPPDATA");
     let bases = [local.as_ref().map(|l| l.join("programs")), local, env("ProgramFiles"), env("ProgramFiles(x86)"), env("APPDATA")];
@@ -591,7 +598,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::install_root;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn steam_dir(base: &Path) -> PathBuf {
+        base.join("Steam")
+    }
 
     #[test]
     fn groups_by_install_folder() {
@@ -610,6 +621,11 @@ mod tests {
         assert_eq!(install_root(&steam.join("steam.exe")), lc(steam));
         let product = base.join("Vendor").join("Product").join("app").join("product.exe");
         assert_eq!(install_root(&product), lc(base.join("Vendor").join("Product")));
+
+        // A game in Steam's library is its own program, not part of Steam.
+        let game = steam_dir(&base).join("steamapps").join("common").join("Wallpaper Engine");
+        assert_eq!(install_root(&game.join("bin").join("wallpaper32.exe")), lc(game.clone()));
+        assert_eq!(install_root(&game.join("wallpaper32.exe")), lc(game));
 
         // Process paths often differ in case from %SystemRoot% ("C:\Windows" vs "C:\WINDOWS").
         let windows = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();

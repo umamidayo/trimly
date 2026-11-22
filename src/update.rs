@@ -50,7 +50,7 @@ fn check() -> Option<Update> {
     let body = https_get("api.github.com", &format!("/repos/{REPO}/releases/latest"))?;
     let release: Release = serde_json::from_slice(&body).ok()?;
     let version = release.tag_name.trim_start_matches('v').to_string();
-    if !newer(&version, env!("CARGO_PKG_VERSION")) {
+    if !newer(&version, &current_version()) {
         return None;
     }
     let asset = release.assets.into_iter().find(|a| a.name.ends_with("Setup.exe"))?;
@@ -110,6 +110,17 @@ fn https_get(host: &str, path: &str) -> Option<Vec<u8>> {
         }
         Some(body)
     }
+}
+
+/// This build's version. Debug builds can pretend to be older with TRIMLY_PRETEND_VERSION=0.0.9,
+/// to see the update prompt against the real latest release. Release builds ignore it.
+pub fn current_version() -> String {
+    if cfg!(debug_assertions) {
+        if let Ok(v) = std::env::var("TRIMLY_PRETEND_VERSION") {
+            return v;
+        }
+    }
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// True when version `a` is newer than `b`, comparing dot-separated numbers ("0.10.0" > "0.9.0").
