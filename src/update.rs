@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
-/// GitHub repo holding the releases, as "owner/name". Until it is set, the check finds nothing.
-const REPO: &str = "OWNER/REPO";
+/// GitHub repo holding the releases, as "owner/name".
+const REPO: &str = "umamidayo/discord-trim";
 const NO_WINDOW: u32 = 0x0800_0000; // CREATE_NO_WINDOW: no console flash
 
 #[derive(Clone)]
