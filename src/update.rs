@@ -1,19 +1,22 @@
-//! Checks GitHub Releases for a newer version on startup and downloads its installer when the user
-//! asks. Uses the curl.exe that ships with Windows 10, so the app needs no HTTP library.
+//! Checks GitHub Releases for a newer version on startup, using WinHTTP (built into Windows).
+//! Installing is left to the browser: "Install" opens the installer's download link, so Trimly
+//! itself never downloads or runs an executable. (Doing that silently is what malware droppers
+//! do, and antivirus heuristics flag it.)
 
+use crate::util::wide;
 use serde::Deserialize;
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::Command;
+use std::ffi::c_void;
+use std::ptr::{null, null_mut};
 use std::sync::Mutex;
+use windows_sys::Win32::Networking::WinHttp::*;
 
 /// GitHub repo holding the releases, as "owner/name".
 const REPO: &str = "umamidayo/trimly";
-const NO_WINDOW: u32 = 0x0800_0000; // CREATE_NO_WINDOW: no console flash
 
 #[derive(Clone)]
 pub struct Update {
     pub version: String,
+    /// The installer's download link, opened in the browser.
     pub url: String,
 }
 
@@ -29,7 +32,7 @@ struct Asset {
     browser_download_url: String,
 }
 
-/// Set by the startup check when a newer release exists; read by the settings window.
+/// Set by the startup check when a newer release exists; read by the window.
 pub static AVAILABLE: Mutex<Option<Update>> = Mutex::new(None);
 
 pub fn check_in_background() {
@@ -44,27 +47,69 @@ pub fn check_in_background() {
 
 /// The newest release, if it is newer than this build and has an installer attached.
 fn check() -> Option<Update> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = curl(&["-sfL", "-H", "User-Agent: Trimly", &url])?;
+    let body = https_get("api.github.com", &format!("/repos/{REPO}/releases/latest"))?;
     let release: Release = serde_json::from_slice(&body).ok()?;
     let version = release.tag_name.trim_start_matches('v').to_string();
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
         return None;
     }
     let asset = release.assets.into_iter().find(|a| a.name.ends_with("Setup.exe"))?;
-    Some(Update { version, url: asset.browser_download_url })
+    // Only ever hand GitHub download links to the browser.
+    asset.browser_download_url.starts_with("https://github.com/")
+        .then(|| Update { version, url: asset.browser_download_url })
 }
 
-/// Saves the installer to the temp folder and returns its path.
-pub fn download(u: &Update) -> Option<PathBuf> {
-    let path = std::env::temp_dir().join(format!("Trimly-Setup-{}.exe", u.version));
-    curl(&["-sfL", "-o", path.to_str()?, &u.url])?;
-    Some(path)
+/// Closes a WinHTTP handle when dropped.
+struct Handle(*mut c_void);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe { WinHttpCloseHandle(self.0) };
+    }
 }
 
-fn curl(args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("curl.exe").args(args).creation_flags(NO_WINDOW).output().ok()?;
-    out.status.success().then_some(out.stdout)
+fn handle(h: *mut c_void) -> Option<Handle> {
+    (!h.is_null()).then_some(Handle(h))
+}
+
+/// GET https://host/path. Returns the body on HTTP 200. Redirects (e.g. a renamed repo) are followed.
+fn https_get(host: &str, path: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let agent = wide("Trimly");
+        let session = handle(WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0))?;
+        let host = wide(host);
+        let conn = handle(WinHttpConnect(session.0, host.as_ptr(), INTERNET_DEFAULT_HTTPS_PORT as u16, 0))?;
+        let (verb, object) = (wide("GET"), wide(path));
+        let req = handle(WinHttpOpenRequest(conn.0, verb.as_ptr(), object.as_ptr(), null(), null(), null(), WINHTTP_FLAG_SECURE))?;
+        let accept = wide("Accept: application/vnd.github+json");
+        if WinHttpSendRequest(req.0, accept.as_ptr(), u32::MAX, null(), 0, 0, 0) == 0
+            || WinHttpReceiveResponse(req.0, null_mut()) == 0
+        {
+            return None;
+        }
+        let (mut status, mut size) = (0u32, 4u32);
+        WinHttpQueryHeaders(req.0, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, null(),
+            &mut status as *mut u32 as _, &mut size, null_mut());
+        if status != 200 {
+            return None;
+        }
+        let mut body = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let mut read = 0u32;
+            if WinHttpReadData(req.0, buf.as_mut_ptr() as _, buf.len() as u32, &mut read) == 0 {
+                return None;
+            }
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..read as usize]);
+            if body.len() > 4 << 20 {
+                return None; // a release listing is a few KB; refuse anything absurd
+            }
+        }
+        Some(body)
+    }
 }
 
 /// True when version `a` is newer than `b`, comparing dot-separated numbers ("0.10.0" > "0.9.0").

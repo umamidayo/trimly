@@ -1,14 +1,15 @@
-//! Trimly: a tiny tray app that keeps Discord's (and other apps') memory use down.
-//! See README.md for how it works and how to add a feature.
+//! Trimly: a tiny tray app that keeps the apps you choose lean on memory.
+//! See README.md for how it works.
 
 #![windows_subsystem = "windows"]
 
 mod autostart;
 mod config;
+mod engine;
 mod procs;
 mod settings;
+mod theme;
 mod tray;
-mod tweaks;
 mod update;
 mod util;
 
@@ -42,16 +43,10 @@ fn main() {
 
         config::migrate_old_dir();
         autostart::migrate_old_value();
-        let mut cfg = config::load();
-        if !cfg.first_run_done {
-            // Start with Windows by default; the tray menu can turn it off.
-            autostart::set(true);
-            cfg.first_run_done = true;
-            config::save(&cfg);
-        } else if autostart::is_enabled() {
-            autostart::set(true); // keep the startup entry pointing at this exe
-        }
-        let app = tray::App { cfg, tweaks: tweaks::all() };
+        // Start with Windows is only ever turned on by the user: a checkbox in the installer, the
+        // tray menu or the window. Adding it silently on first launch looks like malware
+        // persistence to antivirus heuristics.
+        let app = tray::App { cfg: config::load() };
         tray::run(app);
         CloseHandle(mutex);
     }

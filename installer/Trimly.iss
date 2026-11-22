@@ -31,13 +31,20 @@ RestartApplications=no
 [Files]
 Source: "{#ExeDir}\Trimly.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+[Tasks]
+Name: "autostart"; Description: "Start Trimly when I sign in to Windows"
+Name: "desktopicon"; Description: "Create a desktop shortcut"
+
 [Icons]
 Name: "{group}\Trimly"; Filename: "{app}\Trimly.exe"
 Name: "{group}\Uninstall Trimly"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Trimly"; Filename: "{app}\Trimly.exe"; Tasks: desktopicon
+
+[Registry]
+; Start with Windows, only when the user ticks it here (the app never adds itself on its own).
+; uninsdeletevalue also removes it if it was turned on later from inside the app.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Trimly"; ValueData: """{app}\Trimly.exe"""; Flags: uninsdeletevalue; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Trimly"; Flags: uninsdeletevalue dontcreatekey; Check: not WizardIsTaskSelected('autostart')
 
 [Run]
 Filename: "{app}\Trimly.exe"; Description: "Start Trimly"; Flags: nowait postinstall skipifsilent
-
-[UninstallRun]
-; Remove the "Start with Windows" entry the app adds, so Windows doesn't launch a deleted exe.
-Filename: "{sys}\reg.exe"; Parameters: "delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v Trimly /f"; Flags: runhidden; RunOnceId: "RemoveAutostart"

@@ -1,84 +1,88 @@
 # Trimly
 
-A tiny Windows tray app that keeps memory-hungry apps lean: Discord first, plus Steam, Windows Explorer and CTF Loader. It never modifies those apps' files, so their updates don't affect it, and every feature keeps working. Written in Rust with direct Win32 calls; the settings window is an HTML page in WebView2.
-
-## What it does
-
-**Trim Discord memory when hidden.** When none of Discord's windows are shown for `trim_delay_secs` (default 30 seconds), it calls `EmptyWorkingSet` on each Discord process. Memory Discord isn't using moves out of RAM, and Windows loads it back on demand. Task Manager's memory column drops right away. The saving is real but depends on how much Discord had in use. In a test on an already-hidden Discord it freed about 16 MB out of 1040 MB.
-
-**Efficiency mode for hidden Discord.** While no Discord window is shown, its processes are put into Windows efficiency mode (EcoQoS). This lowers CPU scheduling and power use. It doesn't change what Discord does. It's removed the moment a window is restored.
-
-"Shown" means a visible, restored, titled Discord window. Tool windows such as the in-game overlay don't count, so the overlay doesn't keep Discord out of the idle state.
-
-Both features poll every 2 seconds and stop as soon as you turn them off. Both are on by default. Toggle either one from the tray menu.
-
-**Trim Discord memory while visible (on by default).** Trims Discord every `active_trim_interval_secs` (default 300) even when its windows are shown, for when Discord is on another monitor. A trim on visible Discord can cause a short pause while it pages memory back in.
-
-**Settings window.** Left-click the tray icon, or launch Trimly again (for example from the Start menu), to open it. Right-click the tray icon for the menu. The **Overview** tab shows measured results: Discord's RAM right now with a live one-minute chart, a **Trim Discord now** button that reports what it freed, and the trims run and memory freed across all apps. "Freed" is the working-set drop measured around each `EmptyWorkingSet` call. The **Settings** tab has a switch for every feature and a stepper for every timing; changes apply and save immediately. The window follows the Windows light/dark setting, and its WebView2 is shut down when you close it, so it costs no memory in the background.
-
-**Updates.** On start, the app checks this repo's latest GitHub release. If it's newer, the Settings window shows **Install update vX**, which downloads and runs the installer. Nothing installs without that click.
-
-## Releasing a new version
-
-1. Bump the version in `Cargo.toml` and in `installer/Trimly.iss`.
-2. Run `release.bat`. It builds `dist\Trimly-Setup.exe` (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
-3. Publish a GitHub release tagged `vX.Y.Z` with `Trimly-Setup.exe` attached.
-
-## What it does not do
-
-- It doesn't cap Discord's heap or set memory limits. A limit can crash Discord, so none is applied.
-- It doesn't touch Discord's settings, files, or network traffic.
-- It doesn't change push-to-talk. PTT is handled by Discord's own global hook, which this app doesn't touch.
+A small Windows tray app that keeps the apps you choose lean on memory: Discord, Steam, your browser, anything. It never modifies those apps or their files, so their updates don't affect it, and every feature keeps working. Written in Rust with direct Win32 calls; the window is an HTML page in WebView2.
 
 ## Install
 
-Download `Trimly-Setup.exe` from the [latest release](https://github.com/umamidayo/trimly/releases/latest) and run it. It installs for your user only, with no administrator prompt. Windows SmartScreen may warn because the installer isn't code-signed.
+Download `Trimly-Setup.exe` from the [latest release](https://github.com/umamidayo/trimly/releases/latest) and run it. It installs for your user only, with no administrator prompt, and offers two options: start with Windows, and a desktop shortcut.
+
+## How it works
+
+Add apps in the **Apps** tab. The picker lists running programs by name and memory use. An app's helper processes are included automatically: Steam brings `steamwebhelper.exe`, because both are installed in the same folder.
+
+Each app has one choice of **when to trim**:
+
+| Mode | What happens |
+| --- | --- |
+| When hidden | Trimmed once none of its windows have been open for one interval, then every interval while it stays hidden. |
+| Always | Trimmed every interval, even while you use it. For apps kept open on a second monitor. May cause a brief pause. |
+| Paused | Not trimmed. Its memory is still shown. |
+
+and one switch, **efficiency mode while hidden**: Windows' EcoQoS, which lowers the app's CPU priority while none of its windows are open and is removed the moment one opens.
+
+Trimming calls `EmptyWorkingSet`: memory the app isn't using moves out of RAM, and Windows loads it back on demand. The app keeps its memory and behaves the same. "Shown" means a visible, restored, titled window; tool windows such as Discord's in-game overlay don't count.
+
+The **Settings** tab has the two intervals (hidden apps, default 1 min; always-on apps, default 5 min), **Pause trimming**, **Start with Windows**, and the theme.
+
+## The window
+
+- **Overview**: total RAM of your apps with a 10-minute chart, **Trim all now**, system memory, and each app with its own trim button.
+- **Apps**: add, configure and remove apps.
+- **Stats**: memory freed all time and this session, biggest single trim, average per trim, a per-app breakdown, and recent activity. All-time numbers are kept in `stats.json`.
+- **Settings**: trimming, appearance, general.
+
+Themes: **Mint** (default dark), **Ember** (warm dark), **Daylight** (light), or **Match Windows**. The window is resizable, remembers its size, and uses two columns when wide. Its WebView2 is shut down when you close it, so it costs no memory in the background. Left-click the tray icon to open it; right-click for the menu.
+
+On start, Trimly checks this repo's latest release over HTTPS. If it's newer, the window shows **Download**, which opens the installer's link in your browser. Trimly never downloads or runs anything itself.
+
+## Data
+
+Everything lives in `%APPDATA%\Trimly`: `config.json` (apps and settings), `stats.json` (all-time totals) and `WebView2\` (the window's browser cache). Older configs from before the app list existed are converted automatically.
+
+## Antivirus false positives
+
+Trimly opens other processes and changes their memory and CPU priority, which is also what some malware does. Small unsigned programs like this one can trip Windows Defender's machine-learning detections (for example `Trojan:Win32/Bearfoos.A!ml`). To keep that unlikely, Trimly:
+
+- never downloads or launches executables (updates go through the browser),
+- never adds itself to startup on its own (only when you tick it),
+- starts no hidden child processes,
+- carries full version information in the exe.
+
+The remaining step is code signing; see [Releasing](#releasing-a-new-version). If a build is flagged anyway, report it to Microsoft as a false positive at <https://www.microsoft.com/wdsi/filesubmission>.
 
 ## Build and run
 
 1. Install Rust once: https://rustup.rs (pick the default MSVC toolchain).
 2. Double-click **`build.bat`**. It closes any running Trimly, builds the release exe, and starts the new one.
 
-The exe is `target\release\Trimly.exe`. On first launch it turns on Start with Windows (untick it in the tray menu). Settings live in `%APPDATA%\Trimly\config.json`:
+`cargo test` runs the unit tests.
 
-```json
-{
-  "tweaks": {},
-  "trim_delay_secs": 30,
-  "trim_interval_secs": 60,
-  "active_trim_interval_secs": 300,
-  "explorer_idle_secs": 10,
-  "explorer_interval_secs": 60,
-  "first_run_done": true
-}
-```
+## Releasing a new version
 
-## Adding a feature
-
-1. Create `src/tweaks/my_feature.rs` with a struct that implements the `Tweak` trait in `src/tweaks/mod.rs`.
-2. Add `pub mod my_feature;` and push it into `all()` in `src/tweaks/mod.rs`.
-
-It then appears in the tray menu and its on/off state is saved to config.json.
+1. Bump the version in `Cargo.toml`, `res/app.rc` (four places) and `installer/Trimly.iss`. The build stops if they disagree.
+2. Run `release.bat`. It builds `dist\Trimly-Setup.exe` (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
+3. Sign `target\release\Trimly.exe` and the installer before publishing, if you have a certificate.
+4. Publish a GitHub release tagged `vX.Y.Z` with `Trimly-Setup.exe` attached.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
 | `src/main.rs` | Single-instance check, starts the tray |
-| `src/tray.rs` | Tray icon, menu, message loop |
-| `src/config.rs` | Load/save config.json |
+| `src/tray.rs` | Tray icon, owner-drawn menu, message loop |
+| `src/engine.rs` | Background thread: measures, trims, efficiency mode, statistics |
+| `src/settings.rs` | The window: WebView2 host, custom title bar and resizing, page commands, app picker |
+| `src/ui.html` | The page (Overview, Apps, Stats, Settings) |
+| `src/config.rs` | Load/save `config.json`, migration from old configs |
+| `src/procs.rs` | Process list, paths, names, memory, window visibility |
+| `src/theme.rs` | Theme palettes for the native parts |
+| `src/update.rs` | GitHub Releases check (WinHTTP) |
 | `src/autostart.rs` | Start with Windows (HKCU Run key) |
-| `src/settings.rs` | Settings window host: WebView2, custom title bar, page commands and state |
-| `src/ui.html` | The settings page (Overview and Settings tabs) |
-| `src/update.rs` | GitHub Releases update check and installer download |
-| `src/procs.rs` | Finds app processes and checks for shown windows |
-| `src/tweaks/mod.rs` | `Tweak` trait and registry |
-| `src/tweaks/trim.rs` | Working-set trim (hidden and visible modes) and the measured totals |
-| `src/tweaks/throttle.rs` | EcoQoS for hidden Discord processes |
-| `res/` | Icon and manifest (per-monitor DPI aware) |
+| `res/` | Icon, version info, manifest |
+| `installer/Trimly.iss` | Inno Setup script |
 
 ## Known limits
 
-- Discord is detected by process name (`Discord.exe`). Discord PTB and Canary use different names and aren't covered.
-- Trimming saves the most when Discord has been idle a long time. Right after you restore its window, Windows pages in what's needed, which can cause a short pause.
-- Efficiency mode affects CPU scheduling only, so it saves less power or CPU than RAM.
+- A program's processes are grouped by install folder. If an app's helpers live somewhere else, add them as their own app.
+- Trimming saves the most on apps that sit in the background for a while. Right after a trim, Windows pages back in what's needed, which can cause a short pause.
+- Some processes (e.g. elevated ones) can only be trimmed when Trimly itself runs as administrator (tray menu > Restart as administrator).

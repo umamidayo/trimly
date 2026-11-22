@@ -1,26 +1,27 @@
-//! Settings window: the page in `ui.html`, shown in a WebView2 inside a plain Win32 window.
-//! The page sends small JSON commands (toggle a feature, change a timing, trim now); Rust
-//! answers by pushing the full state to `dt.update(...)` every second and after each command.
+//! The Trimly window: the page in `ui.html`, shown in a WebView2 inside a frameless, resizable
+//! Win32 window. The page draws its own title bar and resize edges and sends small JSON commands
+//! (add an app, change its mode, trim now, pick a theme...). Rust answers by pushing the full
+//! state to `dt.update(...)` every second and after each command.
 //! The webview exists only while the window is open, so it costs no memory in the background.
 
-use crate::{autostart, config::{self, Config}, tray::{error_box, APP}, tweaks::trim, update, util::wide};
+use crate::config::{AppCfg, Config, Mode};
+use crate::tray::{error_box, update_cfg, APP};
+use crate::{autostart, config, engine, procs, theme, update, util::wide};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
 use std::mem::{size_of, zeroed};
 use std::num::NonZeroIsize;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-};
-use windows_sys::Win32::UI::Controls::MARGINS;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows_sys::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::Controls::MARGINS;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use wry::raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle};
@@ -31,17 +32,23 @@ const HTML: &str = include_str!("ui.html");
 const WM_PUSH_STATE: u32 = WM_APP + 20;
 const TIMER_ID: usize = 1;
 const MB: f64 = 1024.0 * 1024.0;
-// Window client size in 96-DPI pixels.
-const WIDTH: i32 = 460;
-const HEIGHT: i32 = 790;
-
-/// True while the update installer is downloading, so a second click can't start another.
-static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+// Default and minimum window size in 96-DPI pixels.
+const DEFAULT_SIZE: (i32, i32) = (480, 800);
+const MIN_SIZE: (i32, i32) = (400, 540);
+const THEMES: [&str; 4] = ["system", "mint", "ember", "daylight"];
+/// Processes never offered in the "Add app" list: core Windows parts and Trimly's own.
+const HIDDEN_PROCESSES: [&str; 16] = [
+    "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe",
+    "services.exe", "lsass.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "winlogon.exe", "trimly.exe",
+    "msedgewebview2.exe", "lsaiso.exe",
+];
 
 thread_local! {
     static WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
     static WEBVIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
     static CLASS_READY: Cell<bool> = const { Cell::new(false) };
+    /// exe path -> display name, so reopening the picker is fast.
+    static NAMES: RefCell<HashMap<PathBuf, String>> = RefCell::new(HashMap::new());
 }
 
 /// Commands the page can send. Anything else is ignored.
@@ -49,27 +56,25 @@ thread_local! {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Cmd {
     Ready,
-    Feature { id: String, on: bool },
-    Autostart { on: bool },
-    Timing { index: usize, value: u64 },
-    TrimNow { app: Option<String> },
-    Update,
     Close,
     Minimize,
+    ToggleMaximize,
     /// Mouse down on the page's title bar: hand the drag to Windows.
     Drag,
-}
-
-/// Config fields behind the page's timing rows, by index.
-fn timing_mut(cfg: &mut Config, i: usize) -> Option<&mut u64> {
-    Some(match i {
-        0 => &mut cfg.trim_delay_secs,
-        1 => &mut cfg.trim_interval_secs,
-        2 => &mut cfg.active_trim_interval_secs,
-        3 => &mut cfg.explorer_idle_secs,
-        4 => &mut cfg.explorer_interval_secs,
-        _ => return None,
-    })
+    /// Mouse down on a window edge: "l", "r", "t", "b", "tl", "tr", "bl" or "br".
+    Resize { edge: String },
+    TrimNow { app: Option<String> },
+    ListProcesses,
+    AddApp { exe: String },
+    RemoveApp { app: String },
+    SetMode { app: String, mode: Mode },
+    SetEco { app: String, on: bool },
+    Timing { which: String, secs: u64 },
+    Pause { on: bool },
+    Autostart { on: bool },
+    Theme { name: String },
+    Update,
+    OpenFolder,
 }
 
 /// Lets wry attach the webview to our Win32 window.
@@ -83,16 +88,8 @@ impl HasWindowHandle for Host {
     }
 }
 
-/// True when Windows is set to dark mode for apps.
-fn system_dark() -> bool {
-    let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-    let name = wide("AppsUseLightTheme");
-    let (mut v, mut size) = (1u32, 4u32);
-    let rc = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, null_mut(),
-            &mut v as *mut u32 as _, &mut size)
-    };
-    rc == ERROR_SUCCESS && v == 0
+fn cfg() -> Config {
+    APP.with(|a| a.try_borrow().ok().and_then(|a| a.as_ref().map(|app| app.cfg.clone()))).unwrap_or_default()
 }
 
 pub fn open() {
@@ -103,9 +100,8 @@ pub fn open() {
             SetForegroundWindow(existing);
             return;
         }
-        let dark = system_dark();
-        // Matches the page background so there is no white flash before it loads.
-        let bg: (u8, u8, u8) = if dark { (14, 15, 19) } else { (243, 244, 248) };
+        let cfg = cfg();
+        let pal = theme::palette(&cfg.theme);
         let hinst = GetModuleHandleW(null());
         let class = wide("TrimlySettings");
         if !CLASS_READY.get() {
@@ -114,7 +110,6 @@ pub fn open() {
                 lpfnWndProc: Some(wnd_proc),
                 hInstance: hinst,
                 lpszClassName: class.as_ptr(),
-                hbrBackground: CreateSolidBrush(bg.0 as u32 | (bg.1 as u32) << 8 | (bg.2 as u32) << 16),
                 hCursor: LoadCursorW(null_mut(), IDC_ARROW),
                 hIcon: LoadIconW(hinst, 1 as _),
                 ..zeroed()
@@ -122,29 +117,30 @@ pub fn open() {
             CLASS_READY.set(RegisterClassExW(&wc) != 0);
         }
         let title = wide("Trimly");
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
         let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT,
             0, 0, null_mut(), null_mut(), hinst, null());
         if hwnd.is_null() {
             return;
         }
         WINDOW.set(hwnd);
-        if dark {
-            let on: i32 = 1;
-            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &on as *const i32 as _, 4);
-        }
-        // The page draws its own title bar. WM_NCCALCSIZE removes the system one; a 1 px frame
-        // extension keeps the DWM drop shadow. Rounded corners apply on Windows 11 only.
+        set_background(hwnd, pal.bg);
+        // The page draws its own title bar and edges. WM_NCCALCSIZE removes the system frame; a
+        // 1 px frame extension keeps the DWM drop shadow. Rounded corners apply on Windows 11 only.
         let margins = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 1, cyBottomHeight: 0 };
         DwmExtendFrameIntoClientArea(hwnd, &margins);
         let round: i32 = 2; // DWMWCP_ROUND
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32, &round as *const i32 as _, 4);
-        place(hwnd);
+        place(hwnd, cfg.window_size.unwrap_or(DEFAULT_SIZE));
 
+        let bg = pal.bg;
+        // Open in the saved theme, so the page never flashes the default one first.
+        let html = HTML.replacen(r#"<html lang="en" data-theme="mint">"#,
+            &format!(r#"<html lang="en" data-theme="{}">"#, theme::resolve(&cfg.theme)), 1);
         let mut ctx = WebContext::new(Some(config::dir().join("WebView2")));
         let built = WebViewBuilder::new_with_web_context(&mut ctx)
-            .with_html(HTML)
-            .with_background_color((bg.0, bg.1, bg.2, 255))
+            .with_html(html)
+            .with_background_color(((bg & 0xff) as u8, (bg >> 8 & 0xff) as u8, (bg >> 16 & 0xff) as u8, 255))
             .with_devtools(cfg!(debug_assertions))
             .with_ipc_handler(|req| on_command(req.body()))
             .build(&Host(hwnd));
@@ -153,7 +149,7 @@ pub fn open() {
             Err(e) => {
                 DestroyWindow(hwnd);
                 error_box(&format!(
-                    "The settings window needs the Microsoft Edge WebView2 Runtime.\n\
+                    "The Trimly window needs the Microsoft Edge WebView2 Runtime.\n\
                      Get it from https://developer.microsoft.com/microsoft-edge/webview2/\n\n({e})"
                 ));
                 return;
@@ -165,15 +161,37 @@ pub fn open() {
     }
 }
 
-/// Sizes the window for its monitor's DPI and centers it in the work area. The window has no
-/// system frame, so its size is the page size. SWP_FRAMECHANGED applies the WM_NCCALCSIZE change.
-unsafe fn place(hwnd: HWND) {
-    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+/// Closes the window if it is open (used when Trimly exits).
+pub fn close() {
+    let hwnd = WINDOW.get();
+    if !hwnd.is_null() {
+        unsafe { DestroyWindow(hwnd) };
+    }
+}
+
+/// Paints the area behind the page in the theme color, so resizing never flashes white.
+unsafe fn set_background(hwnd: HWND, color: u32) {
+    let old = SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, CreateSolidBrush(color) as isize);
+    if old != 0 {
+        DeleteObject(old as HGDIOBJ);
+    }
+    InvalidateRect(hwnd, null(), 1);
+}
+
+fn dpi(hwnd: HWND) -> i32 {
+    unsafe { GetDpiForWindow(hwnd) }.max(96) as i32
+}
+
+/// Sizes the window (96-DPI size, scaled to its monitor) and centers it in the work area.
+/// SWP_FRAMECHANGED applies the WM_NCCALCSIZE change.
+unsafe fn place(hwnd: HWND, (w96, h96): (i32, i32)) {
+    let d = dpi(hwnd);
     let mut mi: MONITORINFO = zeroed();
     mi.cbSize = size_of::<MONITORINFO>() as u32;
     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut mi);
     let work = mi.rcWork;
-    let (w, h) = (WIDTH * dpi / 96, (HEIGHT * dpi / 96).min(work.bottom - work.top));
+    let w = (w96.max(MIN_SIZE.0) * d / 96).min(work.right - work.left);
+    let h = (h96.max(MIN_SIZE.1) * d / 96).min(work.bottom - work.top);
     let (x, y) = (work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2);
     SetWindowPos(hwnd, null_mut(), x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
 }
@@ -189,42 +207,57 @@ fn eval(js: &str) {
     });
 }
 
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / MB
+}
+
 /// Everything the page shows, as JSON.
 fn state_json() -> String {
-    let (features, timings) = APP.with(|a| {
-        let a = a.try_borrow().ok()?;
-        let app = a.as_ref()?;
-        let features: Vec<_> = app.tweaks.iter()
-            .map(|t| json!({ "id": t.id(), "name": t.name(), "on": t.is_enabled() }))
-            .collect();
-        let mut cfg = app.cfg.clone();
-        let timings: Vec<u64> = (0..5).filter_map(|i| timing_mut(&mut cfg, i).map(|v| *v)).collect();
-        Some((features, timings))
-    }).unwrap_or_default();
-    let freed_by_app = trim::FREED_BY_APP.lock().map(|m| m.clone()).unwrap_or_default();
-    let feature_on = |id: &str| features.iter().any(|f| f["id"] == id && f["on"] == true);
-    let apps: Vec<_> = trim::APPS.iter().map(|app| {
-        let ram = trim::app_ram(app);
+    let cfg = cfg();
+    let hwnd = WINDOW.get();
+    let (total, avail) = engine::system_memory();
+    let update = update::AVAILABLE.lock().ok().and_then(|g| g.as_ref().map(|u| u.version.clone()));
+    let s = engine::STATS.lock();
+    let Ok(s) = s else { return "null".into() };
+    let apps: Vec<Value> = cfg.apps.iter().map(|app| {
+        let a = s.apps.get(app.key()).cloned().unwrap_or_default();
         json!({
+            "key": app.key(),
             "name": app.name,
-            "running": ram.is_some(),
-            "ramMb": ram.unwrap_or(0) as f64 / MB,
-            "auto": app.features.iter().any(|id| feature_on(id)),
-            "freedMb": freed_by_app.get(app.name).copied().unwrap_or(0) as f64 / MB,
+            "exes": app.exes,
+            "mode": app.mode,
+            "eco": app.eco,
+            "running": a.running,
+            "ramMb": mb(a.ram),
+            "peakMb": mb(a.peak),
+            "procs": a.procs,
+            "freedMb": mb(a.freed),
+            "allFreedMb": mb(s.all.per_app.get(&app.name).copied().unwrap_or(0)),
+            "trims": a.trims,
+            "lastTrim": a.last_trim,
         })
     }).collect();
-    let update = update::AVAILABLE.lock().ok().and_then(|g| g.as_ref().map(|u| u.version.clone()));
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "apps": apps,
-        "trims": trim::TRIMS.load(Ordering::Relaxed),
-        "freedMb": trim::FREED_BYTES.load(Ordering::Relaxed) as f64 / MB,
-        "features": features,
+        "now": engine::now(),
+        "active": unsafe { GetForegroundWindow() } == hwnd,
+        "maximized": unsafe { IsZoomed(hwnd) } != 0,
+        "theme": theme::resolve(&cfg.theme),
+        "themeSetting": cfg.theme,
+        "paused": cfg.paused,
         "autostart": autostart::is_enabled(),
-        "timings": timings,
+        "hiddenEvery": cfg.hidden_every_secs,
+        "alwaysEvery": cfg.always_every_secs,
         "update": update,
-        "downloading": DOWNLOADING.load(Ordering::Relaxed),
-        "active": unsafe { GetForegroundWindow() } == WINDOW.get(),
+        "system": { "totalMb": mb(total), "usedMb": mb(total.saturating_sub(avail)) },
+        "session": { "freedMb": mb(s.freed), "trims": s.trims, "started": s.started },
+        "allTime": {
+            "freedMb": mb(s.all.freed), "trims": s.all.trims, "since": s.all.since,
+            "biggestMb": mb(s.all.biggest), "biggestApp": s.all.biggest_app,
+        },
+        "history": s.history.iter().map(|&b| (mb(b) * 10.0).round() / 10.0).collect::<Vec<_>>(),
+        "apps": apps,
+        "events": s.events.iter().map(|e| json!({ "at": e.at, "app": e.app, "freedMb": mb(e.freed) })).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -233,15 +266,150 @@ fn push_state() {
     eval(&format!("window.dt && dt.update({})", state_json()));
 }
 
-/// Applies a change to the running app and saves it. Skipped if the app is busy (it never
-/// is for long; the next state push shows the real value either way).
-fn with_app(f: impl FnOnce(&mut crate::tray::App) -> bool) {
-    APP.with(|a| {
-        let Ok(mut a) = a.try_borrow_mut() else { return };
-        let Some(app) = a.as_mut() else { return };
-        if f(app) {
-            config::save(&app.cfg);
-            app.sync();
+/// Display name for an exe: its file description, else its file name without ".exe".
+fn display_name(path: Option<&Path>, exe: &str) -> String {
+    let fallback = || {
+        let stem = exe.strip_suffix(".exe").or(exe.strip_suffix(".EXE")).unwrap_or(exe);
+        let mut c = stem.chars();
+        c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+    };
+    let Some(path) = path else { return fallback() };
+    NAMES.with(|n| {
+        n.borrow_mut()
+            .entry(path.to_path_buf())
+            .or_insert_with(|| procs::file_description(path).unwrap_or_else(fallback))
+            .clone()
+    })
+}
+
+/// True when a folder directly holds an .exe (a product folder, not a vendor folder).
+fn has_exe(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map_or(false, |entries| {
+        entries.flatten().any(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+    })
+}
+
+/// The folder an app is installed in (lowercase), used to group its processes: Steam's
+/// steam.exe and its steamwebhelper.exe (deep in Steam\bin\cef\...) both belong to "...\steam".
+///   - Under Program Files, AppData and similar: the program's folder there. A vendor folder such
+///     as "Program Files\Google", which holds no exe itself, goes one level deeper ("google\chrome").
+///   - Elsewhere (e.g. E:\Steam): the highest folder above the exe that directly holds an exe.
+/// None for Windows' own programs, which are never grouped.
+fn install_root(path: &Path) -> Option<PathBuf> {
+    // Windows paths are case-insensitive, and SystemRoot is often "C:\WINDOWS" while process
+    // paths say "C:\Windows", so compare in lowercase.
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let path = lower(path);
+    let env = |k: &str| std::env::var_os(k).map(|v| lower(Path::new(&v)));
+    if env("SystemRoot").is_some_and(|w| path.starts_with(w)) {
+        return None;
+    }
+    let local = env("LOCALAPPDATA");
+    let bases = [local.as_ref().map(|l| l.join("programs")), local, env("ProgramFiles"), env("ProgramFiles(x86)"), env("APPDATA")];
+    for base in bases.into_iter().flatten() {
+        let Ok(rest) = path.strip_prefix(&base) else { continue };
+        let mut parts = rest.components();
+        let (Some(first), Some(second)) = (parts.next(), parts.next()) else { break };
+        let top = base.join(first);
+        if parts.next().is_none() || has_exe(&top) {
+            return Some(top);
+        }
+        return Some(top.join(second));
+    }
+    let dir = path.parent()?;
+    let mut root = dir.to_path_buf();
+    for folder in dir.ancestors().skip(1) {
+        if folder.parent().is_none() {
+            break; // never group a whole drive
+        }
+        if has_exe(folder) {
+            root = folder.to_path_buf();
+        }
+    }
+    Some(root)
+}
+
+/// One installed program and its running processes.
+struct Group {
+    /// Lowercase exe names; the main one first.
+    exes: Vec<String>,
+    /// File name (original case) and path of each exe, in the same order.
+    files: Vec<(String, Option<PathBuf>)>,
+    pids: Vec<u32>,
+}
+
+/// Running processes grouped by the program they belong to.
+fn running_groups() -> Vec<Group> {
+    // Path and install folder per exe name, looked up once rather than per process.
+    let mut seen: HashMap<String, (Option<PathBuf>, Option<PathBuf>)> = HashMap::new();
+    let mut groups: BTreeMap<String, (Option<PathBuf>, Group)> = BTreeMap::new();
+    for (pid, file) in procs::snapshot() {
+        let exe = file.to_ascii_lowercase();
+        if pid <= 4 || HIDDEN_PROCESSES.contains(&exe.as_str()) {
+            continue;
+        }
+        let (path, root) = seen.entry(exe.clone()).or_insert_with(|| {
+            let path = procs::exe_path(pid);
+            let root = path.as_deref().and_then(install_root);
+            (path, root)
+        }).clone();
+        let key = root.as_ref().map_or_else(|| exe.clone(), |r| r.to_string_lossy().to_lowercase());
+        let (_, g) = groups.entry(key).or_insert_with(|| (root, Group { exes: vec![], files: vec![], pids: vec![] }));
+        if !g.exes.contains(&exe) {
+            g.exes.push(exe);
+            g.files.push((file, path));
+        }
+        g.pids.push(pid);
+    }
+    groups.into_values().map(|(root, mut g)| {
+        // Main exe: the one named like its folder (Steam\steam.exe), else the one with a description.
+        let folder = root.as_ref().and_then(|r| r.file_name()).map(|f| f.to_string_lossy().to_lowercase());
+        let main = g.exes.iter().position(|e| folder.as_deref().is_some_and(|f| e.trim_end_matches(".exe") == f))
+            .or_else(|| g.files.iter().position(|(_, p)| p.as_deref().and_then(procs::file_description).is_some()))
+            .unwrap_or(0);
+        g.exes.swap(0, main);
+        g.files.swap(0, main);
+        g
+    }).collect()
+}
+
+/// Running programs for the "Add app" picker, biggest first.
+fn process_list(cfg: &Config) -> Vec<Value> {
+    let mut list: Vec<(u64, Value)> = running_groups().into_iter().filter_map(|g| {
+        let ram: u64 = g.pids.iter().filter_map(|&p| procs::memory(p)).sum();
+        if ram < 15 * 1024 * 1024 {
+            return None; // small background helpers just clutter the list
+        }
+        let (file, path) = &g.files[0];
+        let added = cfg.apps.iter().any(|a| a.exes.iter().any(|e| g.exes.contains(e)));
+        let more = if g.exes.len() > 1 { format!(" + {} more", g.exes.len() - 1) } else { String::new() };
+        Some((ram, json!({
+            "exe": g.exes[0],
+            "file": format!("{file}{more}"),
+            "name": display_name(path.as_deref(), file),
+            "ramMb": mb(ram),
+            "procs": g.pids.len(),
+            "added": added,
+        })))
+    }).collect();
+    list.sort_by(|a, b| b.0.cmp(&a.0));
+    list.into_iter().take(80).map(|(_, v)| v).collect()
+}
+
+/// Builds an app from a running exe, together with every other exe of the same program.
+fn new_app(exe: &str) -> Option<AppCfg> {
+    let exe = exe.to_ascii_lowercase();
+    let g = running_groups().into_iter().find(|g| g.exes.contains(&exe))?;
+    let (file, path) = &g.files[0];
+    let name: String = display_name(path.as_deref(), file).chars().take(60).collect();
+    Some(AppCfg { name, exes: g.exes, mode: Mode::Hidden, eco: false })
+}
+
+/// Changes one app (found by key) in the config.
+fn with_app(key: &str, f: impl FnOnce(&mut AppCfg)) {
+    update_cfg(|c| {
+        if let Some(app) = c.apps.iter_mut().find(|a| a.key() == key) {
+            f(app);
         }
     });
 }
@@ -249,75 +417,107 @@ fn with_app(f: impl FnOnce(&mut crate::tray::App) -> bool) {
 /// Handles one message from the page. The page is ours, but input is still checked here.
 fn on_command(body: &str) {
     let Ok(cmd) = serde_json::from_str::<Cmd>(body) else { return };
+    let hwnd = WINDOW.get();
     match cmd {
         Cmd::Ready => {}
-        Cmd::Feature { id, on } => with_app(|app| {
-            let known = app.tweaks.iter().any(|t| t.id() == id);
-            if known {
-                app.cfg.tweaks.insert(id, on);
-            }
-            known
-        }),
-        Cmd::Autostart { on } => autostart::set(on),
-        Cmd::Timing { index, value } => with_app(|app| {
-            let Some(slot) = timing_mut(&mut app.cfg, index) else { return false };
-            *slot = value.clamp(1, 86_400);
-            true
-        }),
-        Cmd::TrimNow { app } => {
-            // A named app trims just that app; no name trims every tracked app.
-            let picked: Vec<_> = trim::APPS.iter().filter(|a| app.as_deref().map_or(true, |n| n == a.name)).collect();
-            if picked.is_empty() {
-                return;
-            }
-            let freed: u64 = picked.iter().map(|a| trim::trim_app(a)).sum();
-            let label = serde_json::to_string(&app).unwrap_or_else(|_| "null".into());
-            eval(&format!("window.dt && dt.trimmed({}, {label})", freed as f64 / MB));
-        }
-        Cmd::Update => start_update(),
         Cmd::Close => {
-            unsafe { PostMessageW(WINDOW.get(), WM_CLOSE, 0, 0) };
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
             return;
         }
         Cmd::Minimize => {
-            unsafe { PostMessageW(WINDOW.get(), WM_SYSCOMMAND, SC_MINIMIZE as usize, 0) };
+            unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0) };
             return;
         }
-        Cmd::Drag => {
+        Cmd::ToggleMaximize => {
+            let sc = if unsafe { IsZoomed(hwnd) } != 0 { SC_RESTORE } else { SC_MAXIMIZE };
+            unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, sc as usize, 0) };
+            return;
+        }
+        Cmd::Drag | Cmd::Resize { .. } => {
+            let hit = match &cmd {
+                Cmd::Resize { edge } => match edge.as_str() {
+                    "l" => HTLEFT, "r" => HTRIGHT, "t" => HTTOP, "b" => HTBOTTOM,
+                    "tl" => HTTOPLEFT, "tr" => HTTOPRIGHT, "bl" => HTBOTTOMLEFT, "br" => HTBOTTOMRIGHT,
+                    _ => return,
+                },
+                _ => HTCAPTION,
+            };
+            if hit != HTCAPTION && unsafe { IsZoomed(hwnd) } != 0 {
+                return; // a maximized window has no edges to drag
+            }
             unsafe {
                 let mut pt: POINT = zeroed();
                 GetCursorPos(&mut pt);
                 ReleaseCapture();
                 let at = ((pt.y as u16 as u32) << 16 | pt.x as u16 as u32) as LPARAM;
-                PostMessageW(WINDOW.get(), WM_NCLBUTTONDOWN, HTCAPTION as usize, at);
+                PostMessageW(hwnd, WM_NCLBUTTONDOWN, hit as usize, at);
             }
             return;
         }
+        Cmd::TrimNow { app } => {
+            let cfg = cfg();
+            let freed = match &app {
+                Some(key) => match cfg.apps.iter().find(|a| a.key() == key) {
+                    Some(a) => engine::trim_now(a),
+                    None => return,
+                },
+                None => engine::trim_all(&cfg),
+            };
+            let label = serde_json::to_string(&app).unwrap_or_else(|_| "null".into());
+            eval(&format!("window.dt && dt.trimmed({}, {label})", mb(freed)));
+        }
+        Cmd::ListProcesses => {
+            let list = Value::Array(process_list(&cfg()));
+            eval(&format!("window.dt && dt.processes({list})"));
+            return;
+        }
+        Cmd::AddApp { exe } => {
+            let taken = cfg().apps.iter().any(|a| a.exes.iter().any(|e| e.eq_ignore_ascii_case(&exe)));
+            match new_app(&exe) {
+                Some(app) if !taken => {
+                    let name = serde_json::to_string(&app.name).unwrap_or_default();
+                    update_cfg(|c| c.apps.push(app));
+                    eval(&format!("window.dt && dt.added({name})"));
+                }
+                _ => return,
+            }
+        }
+        Cmd::RemoveApp { app } => update_cfg(|c| c.apps.retain(|a| a.key() != app)),
+        Cmd::SetMode { app, mode } => with_app(&app, |a| a.mode = mode),
+        Cmd::SetEco { app, on } => with_app(&app, |a| a.eco = on),
+        Cmd::Timing { which, secs } => {
+            let secs = secs.clamp(10, 86_400);
+            match which.as_str() {
+                "hidden" => update_cfg(|c| c.hidden_every_secs = secs),
+                "always" => update_cfg(|c| c.always_every_secs = secs),
+                _ => return,
+            }
+        }
+        Cmd::Pause { on } => update_cfg(|c| c.paused = on),
+        Cmd::Autostart { on } => autostart::set(on),
+        Cmd::Theme { name } => {
+            if !THEMES.contains(&name.as_str()) {
+                return;
+            }
+            update_cfg(|c| c.theme = name.clone());
+            unsafe { set_background(hwnd, theme::palette(&name).bg) };
+        }
+        Cmd::Update => start_update(),
+        Cmd::OpenFolder => unsafe {
+            let dir = wide(&config::dir().display().to_string());
+            let op = wide("open");
+            ShellExecuteW(null_mut(), op.as_ptr(), dir.as_ptr(), null(), null(), SW_SHOWNORMAL);
+        },
     }
-    unsafe { PostMessageW(WINDOW.get(), WM_PUSH_STATE, 0, 0) };
+    unsafe { PostMessageW(hwnd, WM_PUSH_STATE, 0, 0) };
 }
 
-/// Downloads the newest installer on a worker thread, then runs it. The installer closes the
-/// running app itself (Inno Setup's CloseApplications).
+/// Opens the new installer's download link in the browser. The user runs it from there; the
+/// installer closes the running app itself (Inno Setup's CloseApplications).
 fn start_update() {
     let Some(u) = update::AVAILABLE.lock().ok().and_then(|g| g.clone()) else { return };
-    if DOWNLOADING.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    std::thread::spawn(move || {
-        match update::download(&u) {
-            Some(path) => unsafe {
-                let file = wide(&path.display().to_string());
-                let open = wide("open");
-                ShellExecuteW(null_mut(), open.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL);
-                if let Ok(mut slot) = update::AVAILABLE.lock() {
-                    *slot = None;
-                }
-            },
-            None => error_box("Could not download the update. Check your internet connection, then try again."),
-        }
-        DOWNLOADING.store(false, Ordering::Relaxed);
-    });
+    let (url, open) = (wide(&u.url), wide("open"));
+    unsafe { ShellExecuteW(null_mut(), open.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL) };
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -326,8 +526,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             push_state();
             0
         }
-        // No system title bar or frame: the whole window is client area.
-        WM_NCCALCSIZE if wp != 0 => 0,
+        // No system title bar or frame: the whole window is client area. When maximized, Windows
+        // places the window's invisible frame off-screen, so pull the content back in by that much.
+        WM_NCCALCSIZE if wp != 0 => {
+            if IsZoomed(hwnd) != 0 {
+                let p = &mut *(lp as *mut NCCALCSIZE_PARAMS);
+                let d = dpi(hwnd) as u32;
+                let fx = GetSystemMetricsForDpi(SM_CXFRAME, d) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, d);
+                let fy = GetSystemMetricsForDpi(SM_CYFRAME, d) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, d);
+                let r = &mut p.rgrc[0];
+                r.left += fx;
+                r.right -= fx;
+                r.top += fy;
+                r.bottom -= fy;
+            }
+            0
+        }
+        WM_GETMINMAXINFO => {
+            let info = &mut *(lp as *mut MINMAXINFO);
+            let d = dpi(hwnd);
+            info.ptMinTrackSize = POINT { x: MIN_SIZE.0 * d / 96, y: MIN_SIZE.1 * d / 96 };
+            0
+        }
         // Focus changed: refresh so the title bar dims or brightens right away.
         WM_ACTIVATE => {
             PostMessageW(hwnd, WM_PUSH_STATE, 0, 0);
@@ -341,11 +561,50 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_ID);
+            // Remember the size (unless maximized or minimized) for next time.
+            if IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 {
+                let mut r: RECT = zeroed();
+                GetWindowRect(hwnd, &mut r);
+                let d = dpi(hwnd);
+                let size = ((r.right - r.left) * 96 / d, (r.bottom - r.top) * 96 / d);
+                update_cfg(|c| c.window_size = Some(size));
+            }
             // Dropping the webview shuts down its browser processes.
             WEBVIEW.with(|w| w.borrow_mut().take());
             WINDOW.set(null_mut());
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_root;
+    use std::path::PathBuf;
+
+    #[test]
+    fn groups_by_install_folder() {
+        // A fake %LOCALAPPDATA% with a product folder (exe at its top) and a vendor folder (no exe).
+        let base = std::env::temp_dir().join(format!("trimly-test-{}", std::process::id()));
+        let steam = base.join("Steam");
+        std::fs::create_dir_all(steam.join("bin").join("cef")).unwrap();
+        std::fs::write(steam.join("steam.exe"), b"").unwrap();
+        std::fs::create_dir_all(base.join("Vendor").join("Product")).unwrap();
+        std::env::set_var("LOCALAPPDATA", &base);
+
+        // Roots come back lowercase.
+        let lc = |p: PathBuf| Some(PathBuf::from(p.to_string_lossy().to_lowercase()));
+        let helper = steam.join("bin").join("cef").join("steamwebhelper.exe");
+        assert_eq!(install_root(&helper), lc(steam.clone()));
+        assert_eq!(install_root(&steam.join("steam.exe")), lc(steam));
+        let product = base.join("Vendor").join("Product").join("app").join("product.exe");
+        assert_eq!(install_root(&product), lc(base.join("Vendor").join("Product")));
+
+        // Process paths often differ in case from %SystemRoot% ("C:\Windows" vs "C:\WINDOWS").
+        let windows = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap();
+        let other_case = PathBuf::from(windows.to_string_lossy().to_lowercase());
+        assert_eq!(install_root(&other_case.join("system32").join("audiodg.exe")), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
