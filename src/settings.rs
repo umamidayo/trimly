@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use wry::raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle};
-use wry::{WebContext, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 const HTML: &str = include_str!("ui.html");
 /// Posted after a command so the page gets fresh state outside the webview's callback.
@@ -143,6 +143,16 @@ pub fn open() {
             .with_background_color(((bg & 0xff) as u8, (bg >> 8 & 0xff) as u8, (bg >> 16 & 0xff) as u8, 255))
             .with_devtools(cfg!(debug_assertions))
             .with_ipc_handler(|req| on_command(req.body()))
+            // Lock the webview to our one inline page (it loads as about:blank). No web pages,
+            // no file:// pages, no popups, no downloads, no dropped files, no browser shortcuts,
+            // so nothing outside ui.html can ever run here or talk to the app.
+            .with_navigation_handler(|url| url.starts_with("about:") || url.starts_with("data:"))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_download_started_handler(|_, _| false)
+            .with_drag_drop_handler(|_| true)
+            .with_browser_accelerator_keys(false)
+            .with_default_context_menus(false)
+            .with_hotkeys_zoom(false)
             .build(&Host(hwnd));
         match built {
             Ok(webview) => WEBVIEW.with(|w| *w.borrow_mut() = Some(webview)),

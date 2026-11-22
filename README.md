@@ -50,6 +50,13 @@ Trimly opens other processes and changes their memory and CPU priority, which is
 
 The remaining step is code signing; see [Releasing](#releasing-a-new-version). If a build is flagged anyway, report it to Microsoft as a false positive at <https://www.microsoft.com/wdsi/filesubmission>.
 
+## Security
+
+- **No secrets.** Trimly has no API keys, tokens or accounts. Its only network request is an anonymous HTTPS read of this repo's latest release on GitHub.
+- **Clean builds.** `release.bat` and `build.bat` strip the build machine's folders (user name, project path) from the exe's embedded source paths.
+- **A locked-down window.** The webview only ever shows Trimly's own built-in page. It can't navigate to web or local pages, open popups, download files, accept dropped files, or use browser shortcuts; developer tools are off in release builds. Every command from the page is checked in Rust before it acts, and app names from other programs are escaped before display.
+- **Least privilege.** Trimly and its installer run as your normal user. Administrator rights are only used when you choose "Restart as administrator".
+
 ## Build and run
 
 1. Install Rust once: https://rustup.rs (pick the default MSVC toolchain).
@@ -60,7 +67,7 @@ The remaining step is code signing; see [Releasing](#releasing-a-new-version). I
 ## Releasing a new version
 
 1. Bump the version in `Cargo.toml`, `res/app.rc` (four places) and `installer/Trimly.iss`. The build stops if they disagree.
-2. Run `release.bat`. It builds `dist\Trimly-Setup.exe` (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)).
+2. Run `release.bat` (not plain `cargo build`, which keeps your local paths in the exe). It builds `dist\Trimly-Setup.exe` with the branded installer (needs [Inno Setup 6.7+](https://jrsoftware.org/isinfo.php)). To change the icon or installer artwork, edit and run `res\make-art.ps1`.
 3. Sign `target\release\Trimly.exe` and the installer before publishing, if you have a certificate.
 4. Publish a GitHub release tagged `vX.Y.Z` with `Trimly-Setup.exe` attached.
 
@@ -78,7 +85,7 @@ The remaining step is code signing; see [Releasing](#releasing-a-new-version). I
 | `src/theme.rs` | Theme palettes for the native parts |
 | `src/update.rs` | GitHub Releases check (WinHTTP) |
 | `src/autostart.rs` | Start with Windows (HKCU Run key) |
-| `res/` | Icon, version info, manifest |
+| `res/` | Icon, version info, manifest, installer artwork (`make-art.ps1` draws them) |
 | `installer/Trimly.iss` | Inno Setup script |
 
 ## Known limits

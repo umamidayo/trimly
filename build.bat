@@ -16,7 +16,8 @@ rem Give Windows a moment to release the exe file.
 ping -n 2 127.0.0.1 >nul
 
 echo [Trimly] Building release...
-cargo build --release
+rem Same path remapping as release.bat, so both scripts share one build cache.
+cargo build --release --config "build.rustflags=['--remap-path-prefix=%USERPROFILE%=~', '--remap-path-prefix=%CD%=trimly']"
 if errorlevel 1 (
   echo.
   echo [Trimly] BUILD FAILED. The new version was not started.

@@ -12,7 +12,9 @@ if not exist "%ISCC%" (
 )
 
 echo [Trimly] Building release...
-cargo build --release
+rem Replace this machine's folders (user name, project path) in the exe's built-in source paths,
+rem so a published build doesn't reveal who built it or where.
+cargo build --release --config "build.rustflags=['--remap-path-prefix=%USERPROFILE%=~', '--remap-path-prefix=%CD%=trimly']"
 if errorlevel 1 exit /b 1
 
 echo [Trimly] Building installer...
